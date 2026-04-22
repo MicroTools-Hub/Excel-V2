@@ -122,7 +122,7 @@ Default URL:
 
 ### Environment Variables for Smart Copilot
 
-- `OLLAMA_BASE_URL` (for example `http://localhost:11434`)
+- `OLLAMA_BASE_URL` (for example `https://ollama.com`)
 - `OLLAMA_API_KEY` (optional, if your Ollama-compatible host requires bearer auth)
 - `OLLAMA_MODEL` (default `deepseek-v3.2:cloud`)
 - `OLLAMA_TIMEOUT_SECONDS` (default `120`)

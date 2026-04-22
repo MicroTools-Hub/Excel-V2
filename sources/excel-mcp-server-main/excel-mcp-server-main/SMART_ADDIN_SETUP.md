@@ -13,12 +13,12 @@ Set environment variables:
 
 ```bash
 # Linux/macOS
-export OLLAMA_BASE_URL="http://localhost:11434"
+export OLLAMA_BASE_URL="https://ollama.com"
 export OLLAMA_MODEL="deepseek-v3.2:cloud"
 export EXCEL_FILES_PATH="./excel_files"
 
 # Windows PowerShell
-$env:OLLAMA_BASE_URL="http://localhost:11434"
+$env:OLLAMA_BASE_URL="https://ollama.com"
 $env:OLLAMA_MODEL="deepseek-v3.2:cloud"
 $env:EXCEL_FILES_PATH="./excel_files"
 ```

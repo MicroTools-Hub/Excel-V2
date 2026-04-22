@@ -14,7 +14,7 @@ class OllamaClient:
         api_key: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
     ) -> None:
-        self.base_url = (base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
+        self.base_url = (base_url or os.environ.get("OLLAMA_BASE_URL", "https://ollama.com")).rstrip("/")
         self.model = model or os.environ.get("OLLAMA_MODEL", "deepseek-v3.2:cloud")
         self.api_key = api_key or os.environ.get("OLLAMA_API_KEY")
         timeout = timeout_seconds or float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))

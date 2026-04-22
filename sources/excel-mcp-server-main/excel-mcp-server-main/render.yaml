@@ -12,7 +12,7 @@ services:
         sizeGB: 1
     envVars:
       - key: OLLAMA_BASE_URL
-        sync: false
+        value: https://ollama.com
       - key: OLLAMA_API_KEY
         sync: false
       - key: OLLAMA_MODEL
