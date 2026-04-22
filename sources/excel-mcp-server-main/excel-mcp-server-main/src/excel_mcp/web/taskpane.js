@@ -183,9 +183,13 @@ function getRangeStartCell(rangeAddress) {
   return rangeAddress.split(":")[0].trim() || "A1";
 }
 
+function getActiveWorksheet(context) {
+  return context.workbook.worksheets.getActiveWorksheet();
+}
+
 async function resolveWorksheet(context, sheetName) {
   if (!sheetName) {
-    return context.workbook.getActiveWorksheet();
+    return getActiveWorksheet(context);
   }
 
   const candidate = context.workbook.worksheets.getItemOrNullObject(String(sheetName));
@@ -193,7 +197,7 @@ async function resolveWorksheet(context, sheetName) {
   await context.sync();
 
   if (candidate.isNullObject) {
-    return context.workbook.getActiveWorksheet();
+    return getActiveWorksheet(context);
   }
 
   return candidate;
