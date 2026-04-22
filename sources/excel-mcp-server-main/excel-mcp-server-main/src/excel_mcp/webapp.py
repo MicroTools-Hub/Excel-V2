@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 
 from excel_mcp.calculations import apply_formula as apply_formula_impl
@@ -214,6 +215,31 @@ def _execute_operation(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {"ok": True, "message": "Range formatted"}
 
+    if operation == "clear_range":
+        filepath = resolve_excel_path(args["filepath"])
+        if not args.get("sheet_name"):
+            raise ValueError("sheet_name is required for clear_range")
+
+        start_cell = str(args.get("start_cell", "A1"))
+        end_cell = str(args.get("end_cell", "")).strip()
+        range_address = str(args.get("range", "")).strip()
+        if not range_address:
+            range_address = f"{start_cell}:{end_cell}" if end_cell else start_cell
+
+        wb = load_workbook(filepath)
+        if args["sheet_name"] not in wb.sheetnames:
+            wb.close()
+            raise ValueError(f"Sheet '{args['sheet_name']}' not found")
+
+        ws = wb[args["sheet_name"]]
+        for row in ws[range_address]:
+            for cell in row:
+                cell.value = None
+
+        wb.save(filepath)
+        wb.close()
+        return {"ok": True, "message": f"Cleared range {range_address} in {args['sheet_name']}"}
+
     if operation == "get_workbook_metadata":
         filepath = resolve_excel_path(args["filepath"])
         info = get_workbook_info(filepath, include_ranges=bool(args.get("include_ranges", False)))
@@ -257,7 +283,9 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
         "Respond with practical spreadsheet guidance. "
         "When an operation should be executed, include an XML-like plan block exactly in this format: "
         "<excel_plan>{\"assistant_reply\":\"...\",\"operations\":[{\"name\":\"write_data\",\"args\":{...}}]}</excel_plan>. "
-        "Supported operation names: create_workbook, create_worksheet, write_data, read_data, apply_formula, format_range, get_workbook_metadata. "
+        "Supported operation names: create_workbook, create_worksheet, write_data, clear_range, read_data, apply_formula, format_range, get_workbook_metadata. "
+        "For write_data, prefer args {start_cell, data, optional sheet_name}; use range only when explicitly requested. "
+        "For clearing cells, prefer clear_range with args {range, optional sheet_name}. "
         "If no operation is needed, operations must be an empty list."
     )
 

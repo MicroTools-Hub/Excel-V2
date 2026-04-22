@@ -1,6 +1,7 @@
 const state = {
   messages: [],
   parsedRows: [],
+  isExcelHost: false,
 };
 
 const ui = {
@@ -145,6 +146,196 @@ function getWorkbookConfig() {
   };
 }
 
+function toRectangularData(rawData) {
+  if (!Array.isArray(rawData)) {
+    return [];
+  }
+
+  if (!rawData.length) {
+    return [];
+  }
+
+  const rows = rawData.map((row) => (Array.isArray(row) ? [...row] : [row]));
+  const width = Math.max(...rows.map((row) => row.length));
+  return rows.map((row) => {
+    const padded = [...row];
+    while (padded.length < width) {
+      padded.push("");
+    }
+    return padded;
+  });
+}
+
+function resolveRangeAddress(args) {
+  if (typeof args.range === "string" && args.range.trim()) {
+    return args.range.trim();
+  }
+
+  const start = typeof args.start_cell === "string" && args.start_cell.trim() ? args.start_cell.trim() : "A1";
+  const end = typeof args.end_cell === "string" && args.end_cell.trim() ? args.end_cell.trim() : "";
+  return end ? `${start}:${end}` : start;
+}
+
+function getRangeStartCell(rangeAddress) {
+  if (typeof rangeAddress !== "string" || !rangeAddress.trim()) {
+    return "A1";
+  }
+  return rangeAddress.split(":")[0].trim() || "A1";
+}
+
+async function resolveWorksheet(context, sheetName) {
+  if (!sheetName) {
+    return context.workbook.getActiveWorksheet();
+  }
+
+  const candidate = context.workbook.worksheets.getItemOrNullObject(String(sheetName));
+  candidate.load("isNullObject");
+  await context.sync();
+
+  if (candidate.isNullObject) {
+    return context.workbook.getActiveWorksheet();
+  }
+
+  return candidate;
+}
+
+async function executeOperationsInExcel(operations) {
+  if (!state.isExcelHost || !window.Excel || !window.Office) {
+    return {
+      executed: 0,
+      warnings: ["Excel host is unavailable for direct operation execution."],
+    };
+  }
+
+  const safeOps = Array.isArray(operations) ? operations : [];
+  const warnings = [];
+  let executed = 0;
+
+  await Excel.run(async (context) => {
+    for (const op of safeOps) {
+      const opName = String(op && op.name ? op.name : "").trim().toLowerCase();
+      const args = op && typeof op.args === "object" && op.args !== null ? op.args : {};
+      const sheet = await resolveWorksheet(context, args.sheet_name);
+
+      if (opName === "write_data") {
+        const rows = toRectangularData(args.data);
+        if (!rows.length) {
+          sheet.getRange(resolveRangeAddress(args)).clear();
+          executed += 1;
+          continue;
+        }
+
+        const rangeAddress = typeof args.range === "string" ? args.range : "";
+        const startCell = typeof args.start_cell === "string" && args.start_cell.trim()
+          ? args.start_cell.trim()
+          : getRangeStartCell(rangeAddress);
+        const target = sheet
+          .getRange(startCell)
+          .getResizedRange(rows.length - 1, rows[0].length - 1);
+        target.values = rows;
+        target.format.autofitColumns();
+        target.format.autofitRows();
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "apply_formula") {
+        const formula = typeof args.formula === "string" ? args.formula : "";
+        if (!formula) {
+          warnings.push("Skipped apply_formula because formula is missing.");
+          continue;
+        }
+        const cell = typeof args.cell === "string" && args.cell.trim()
+          ? args.cell.trim()
+          : (typeof args.start_cell === "string" && args.start_cell.trim() ? args.start_cell.trim() : "A1");
+        sheet.getRange(cell).formulas = [[formula]];
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "format_range") {
+        const range = sheet.getRange(resolveRangeAddress(args));
+
+        if (typeof args.bold === "boolean") {
+          range.format.font.bold = args.bold;
+        }
+        if (typeof args.italic === "boolean") {
+          range.format.font.italic = args.italic;
+        }
+        if (typeof args.underline === "boolean") {
+          range.format.font.underline = args.underline ? "Single" : "None";
+        }
+        if (typeof args.font_color === "string" && args.font_color.trim()) {
+          range.format.font.color = args.font_color.trim().replace(/^#/, "");
+        }
+        if (typeof args.bg_color === "string" && args.bg_color.trim()) {
+          range.format.fill.color = args.bg_color.trim().replace(/^#/, "");
+        }
+        if (typeof args.wrap_text === "boolean") {
+          range.format.wrapText = args.wrap_text;
+        }
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "clear_range") {
+        sheet.getRange(resolveRangeAddress(args)).clear();
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "create_worksheet") {
+        const name = typeof args.sheet_name === "string" && args.sheet_name.trim()
+          ? args.sheet_name.trim()
+          : `Sheet${Date.now()}`;
+        context.workbook.worksheets.add(name);
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "rename_worksheet") {
+        if (!args.old_name || !args.new_name) {
+          warnings.push("Skipped rename_worksheet because old_name/new_name is missing.");
+          continue;
+        }
+        const oldSheet = context.workbook.worksheets.getItemOrNullObject(String(args.old_name));
+        oldSheet.load("isNullObject");
+        await context.sync();
+        if (oldSheet.isNullObject) {
+          warnings.push(`Skipped rename_worksheet: sheet ${args.old_name} was not found.`);
+          continue;
+        }
+        oldSheet.name = String(args.new_name);
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "delete_worksheet") {
+        if (!args.sheet_name) {
+          warnings.push("Skipped delete_worksheet because sheet_name is missing.");
+          continue;
+        }
+        const toDelete = context.workbook.worksheets.getItemOrNullObject(String(args.sheet_name));
+        toDelete.load("isNullObject");
+        await context.sync();
+        if (toDelete.isNullObject) {
+          warnings.push(`Skipped delete_worksheet: sheet ${args.sheet_name} was not found.`);
+          continue;
+        }
+        toDelete.delete();
+        executed += 1;
+        continue;
+      }
+
+      warnings.push(`Skipped unsupported operation: ${opName || "unknown"}.`);
+    }
+
+    await context.sync();
+  });
+
+  return { executed, warnings };
+}
+
 async function sendChat() {
   const prompt = ui.chatInput.value.trim();
   if (!prompt) {
@@ -162,7 +353,7 @@ async function sendChat() {
     filepath: config.filepath || null,
     sheet_name: config.sheet_name || null,
     start_cell: config.start_cell,
-    auto_execute: true,
+    auto_execute: !state.isExcelHost,
   };
 
   try {
@@ -178,13 +369,23 @@ async function sendChat() {
     }
 
     const data = await response.json();
-    const suffix = data.operation_results && data.operation_results.length
-      ? `\n\nExecuted ${data.operation_results.length} operation(s).`
-      : "";
-    appendMessage("assistant", `${data.reply || "No response"}${suffix}`);
+    let executionSuffix = "";
+    if (Array.isArray(data.operations) && data.operations.length) {
+      if (state.isExcelHost) {
+        const localExecution = await executeOperationsInExcel(data.operations);
+        executionSuffix = `\n\nApplied ${localExecution.executed} operation(s) to active workbook.`;
+        if (localExecution.warnings.length) {
+          executionSuffix += `\n${localExecution.warnings.slice(0, 2).join(" ")}`;
+        }
+      } else if (Array.isArray(data.operation_results) && data.operation_results.length) {
+        executionSuffix = `\n\nExecuted ${data.operation_results.length} server operation(s).`;
+      }
+    }
+
+    appendMessage("assistant", `${data.reply || "No response"}${executionSuffix}`);
     state.messages.push({ role: "assistant", content: data.reply || "" });
 
-    updateStatus(ui.actionStatus, `Model: ${data.model}`);
+    updateStatus(ui.actionStatus, state.isExcelHost ? "Applied changes to active workbook." : `Model: ${data.model}`);
   } catch (error) {
     appendMessage("system", `Error: ${error.message}`);
     updateStatus(ui.actionStatus, `Chat error: ${error.message}`, true);
@@ -356,6 +557,7 @@ function bindEvents() {
 
 function initOfficeStatus() {
   if (!window.Office) {
+    state.isExcelHost = false;
     updateStatus(ui.officeStatus, "Office.js unavailable. Web mode only.", true);
     appendMessage("system", "Running in browser mode. Direct Excel paste needs Excel add-in host.");
     return;
@@ -363,9 +565,10 @@ function initOfficeStatus() {
 
   Office.onReady((info) => {
     const inExcel = info && info.host && info.host.toString().toLowerCase().includes("excel");
+    state.isExcelHost = Boolean(inExcel);
     if (inExcel) {
       updateStatus(ui.officeStatus, "Excel connected. Direct paste is enabled.");
-      appendMessage("system", "Excel host detected. Select a cell and use Paste to Active Excel Selection.");
+      appendMessage("system", "Excel host detected. Chat operations now apply directly to the active workbook.");
     } else {
       updateStatus(ui.officeStatus, "Office loaded but Excel host not detected.", true);
       appendMessage("system", "Office loaded. Open in Excel for direct sheet writes.");
