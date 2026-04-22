@@ -392,6 +392,10 @@ async function sendChat() {
       }
     }
 
+    if (Array.isArray(data.operation_validation_warnings) && data.operation_validation_warnings.length) {
+      executionSuffix += `\nValidation warnings: ${data.operation_validation_warnings.slice(0, 2).join(" ")}`;
+    }
+
     appendMessage("assistant", `${data.reply || "No response"}${executionSuffix}`);
     state.messages.push({ role: "assistant", content: data.reply || "" });
 

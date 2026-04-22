@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import inspect
 
 from fastapi import FastAPI, HTTPException
@@ -24,6 +24,21 @@ from excel_mcp.workbook import create_sheet, create_workbook, get_workbook_info
 from excel_mcp import server as mcp_server_module
 
 logger = logging.getLogger("excel-mcp.webapp")
+
+_CELL_REF_RE = re.compile(r"^[A-Za-z]{1,3}[1-9][0-9]{0,6}$")
+_RANGE_REF_RE = re.compile(
+    r"^[A-Za-z]{1,3}[1-9][0-9]{0,6}(:[A-Za-z]{1,3}[1-9][0-9]{0,6})?$"
+)
+_SUPPORTED_OPERATION_NAMES = {
+    "create_workbook",
+    "create_worksheet",
+    "write_data",
+    "clear_range",
+    "read_data",
+    "apply_formula",
+    "format_range",
+    "get_workbook_metadata",
+}
 
 
 class ChatMessage(BaseModel):
@@ -151,6 +166,149 @@ def _summarize_sheet(filepath: str, sheet_name: str) -> Dict[str, Any]:
         "workbook": workbook_info,
         "preview": preview,
     }
+
+
+def _is_valid_cell_ref(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return bool(_CELL_REF_RE.fullmatch(value.strip()))
+
+
+def _is_valid_range_ref(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return bool(_RANGE_REF_RE.fullmatch(value.strip()))
+
+
+def _merge_operation_defaults(args: Dict[str, Any], request: ChatRequest) -> Dict[str, Any]:
+    merged = dict(args)
+    if request.filepath and "filepath" not in merged:
+        merged["filepath"] = request.filepath
+    if request.sheet_name and "sheet_name" not in merged:
+        merged["sheet_name"] = request.sheet_name
+    if request.start_cell and "start_cell" not in merged:
+        merged["start_cell"] = request.start_cell
+    return merged
+
+
+def _validate_operation_pass_one(name: str, args: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+
+    if not name:
+        errors.append("operation name is missing")
+        return errors
+
+    if name not in _SUPPORTED_OPERATION_NAMES:
+        errors.append(f"unsupported operation '{name}'")
+        return errors
+
+    if not isinstance(args, dict):
+        errors.append("operation args must be an object")
+        return errors
+
+    if name == "write_data" and "data" not in args:
+        errors.append("write_data requires data")
+    if name == "apply_formula" and "formula" not in args:
+        errors.append("apply_formula requires formula")
+    if name == "create_worksheet" and not args.get("sheet_name"):
+        errors.append("create_worksheet requires sheet_name")
+
+    if name in {"clear_range", "format_range"} and not (
+        args.get("range") or args.get("start_cell")
+    ):
+        errors.append(f"{name} requires range or start_cell")
+
+    return errors
+
+
+def _validate_operation_pass_two(name: str, args: Dict[str, Any], request: ChatRequest) -> List[str]:
+    errors: List[str] = []
+
+    filepath = args.get("filepath")
+    if request.auto_execute and name in {
+        "create_workbook",
+        "create_worksheet",
+        "write_data",
+        "clear_range",
+        "read_data",
+        "apply_formula",
+        "format_range",
+        "get_workbook_metadata",
+    }:
+        if not isinstance(filepath, str) or not filepath.strip():
+            errors.append("server execution requires filepath")
+        elif os.path.isabs(filepath):
+            errors.append("filepath must be relative, not absolute")
+
+    if "sheet_name" in args and (
+        not isinstance(args.get("sheet_name"), str) or not str(args.get("sheet_name")).strip()
+    ):
+        errors.append("sheet_name must be a non-empty string")
+
+    if "start_cell" in args and args.get("start_cell") and not _is_valid_cell_ref(args.get("start_cell")):
+        errors.append("start_cell is invalid")
+
+    if "end_cell" in args and args.get("end_cell") and not _is_valid_cell_ref(args.get("end_cell")):
+        errors.append("end_cell is invalid")
+
+    if "cell" in args and args.get("cell") and not _is_valid_cell_ref(args.get("cell")):
+        errors.append("cell is invalid")
+
+    if "range" in args and args.get("range") and not _is_valid_range_ref(args.get("range")):
+        errors.append("range is invalid")
+
+    if name == "write_data":
+        data = args.get("data")
+        if not isinstance(data, list) or not data:
+            errors.append("write_data data must be a non-empty list")
+        else:
+            for row in data:
+                if not isinstance(row, list):
+                    errors.append("write_data data must be a 2D list")
+                    break
+
+    if name == "apply_formula":
+        formula = args.get("formula")
+        if not isinstance(formula, str) or not formula.strip():
+            errors.append("formula must be a non-empty string")
+
+    if name == "clear_range" and not (
+        args.get("range") or args.get("start_cell")
+    ):
+        errors.append("clear_range requires range or start_cell")
+
+    return errors
+
+
+def _double_check_operations(
+    operations: List[Dict[str, Any]],
+    request: ChatRequest,
+) -> Tuple[List[Dict[str, Any]], List[str], int]:
+    accepted: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    rejected_count = 0
+
+    for index, op in enumerate(operations[:8], start=1):
+        op_name = str(op.get("name", "")).strip().lower()
+        op_args = op.get("args") if isinstance(op.get("args"), dict) else {}
+        merged_args = _merge_operation_defaults(op_args, request)
+
+        pass_one_errors = _validate_operation_pass_one(op_name, merged_args)
+        pass_two_errors = _validate_operation_pass_two(op_name, merged_args, request)
+
+        if pass_one_errors or pass_two_errors:
+            rejected_count += 1
+            pass_one_text = "; ".join(pass_one_errors) if pass_one_errors else "ok"
+            pass_two_text = "; ".join(pass_two_errors) if pass_two_errors else "ok"
+            warnings.append(
+                f"Operation #{index} '{op_name or 'unknown'}' rejected. "
+                f"Check1={pass_one_text}. Check2={pass_two_text}."
+            )
+            continue
+
+        accepted.append({"name": op_name, "args": merged_args})
+
+    return accepted, warnings, rejected_count
 
 
 def _execute_operation(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -283,6 +441,7 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
         "Respond with practical spreadsheet guidance. "
         "When an operation should be executed, include an XML-like plan block exactly in this format: "
         "<excel_plan>{\"assistant_reply\":\"...\",\"operations\":[{\"name\":\"write_data\",\"args\":{...}}]}</excel_plan>. "
+        "Before returning operations, internally verify each operation twice for required args and reference validity. "
         "Supported operation names: create_workbook, create_worksheet, write_data, clear_range, read_data, apply_formula, format_range, get_workbook_metadata. "
         "For write_data, prefer args {start_cell, data, optional sheet_name}; use range only when explicitly requested. "
         "For clearing cells, prefer clear_range with args {range, optional sheet_name}. "
@@ -320,18 +479,14 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
         if isinstance(ops, list):
             operations = [op for op in ops if isinstance(op, dict)]
 
+    validated_operations, validation_warnings, rejected_count = _double_check_operations(operations, request)
+    operations = validated_operations
+
     results: List[Dict[str, Any]] = []
     if request.auto_execute and operations:
         for op in operations[:8]:
             op_name = str(op.get("name", "")).strip()
-            op_args = op.get("args") if isinstance(op.get("args"), dict) else {}
-            merged_args = dict(op_args)
-            if request.filepath and "filepath" not in merged_args:
-                merged_args["filepath"] = request.filepath
-            if request.sheet_name and "sheet_name" not in merged_args:
-                merged_args["sheet_name"] = request.sheet_name
-            if request.start_cell and "start_cell" not in merged_args:
-                merged_args["start_cell"] = request.start_cell
+            merged_args = op.get("args") if isinstance(op.get("args"), dict) else {}
             try:
                 result = _execute_operation(op_name, merged_args)
                 results.append({"name": op_name, "ok": True, "result": result})
@@ -343,6 +498,12 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
         "model": llm_response["model"],
         "operations": operations,
         "operation_results": results,
+        "operation_validation": {
+            "checked_twice": True,
+            "accepted": len(operations),
+            "rejected": rejected_count,
+        },
+        "operation_validation_warnings": validation_warnings,
     }
 
 
