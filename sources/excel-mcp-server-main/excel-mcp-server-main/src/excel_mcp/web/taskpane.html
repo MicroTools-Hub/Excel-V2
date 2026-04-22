@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Smart Excel Copilot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/ui/taskpane.css" />
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  </head>
+  <body>
+    <div class="bg-orb bg-orb-a"></div>
+    <div class="bg-orb bg-orb-b"></div>
+
+    <div class="app-shell">
+      <header class="app-header">
+        <div>
+          <p class="chip">DeepSeek v3.2 + Ollama</p>
+          <h1>Smart Excel Copilot</h1>
+        </div>
+        <div id="officeStatus" class="status-pill">Checking Excel context...</div>
+      </header>
+
+      <main class="layout">
+        <section class="chat-panel glass">
+          <div id="messages" class="messages"></div>
+
+          <div class="composer-wrap">
+            <textarea
+              id="chatInput"
+              class="composer"
+              placeholder="Ask for formulas, summaries, formatting, or workbook operations..."
+            ></textarea>
+            <div class="composer-actions">
+              <button id="sendBtn" class="btn btn-primary" type="button">Send</button>
+              <button id="clearChatBtn" class="btn btn-ghost" type="button">Clear</button>
+            </div>
+          </div>
+        </section>
+
+        <aside class="tool-panel glass">
+          <h2>Workbook Dock</h2>
+          <label>Workbook file (relative to server excel_files)</label>
+          <input id="filepathInput" type="text" value="demo.xlsx" />
+
+          <label>Worksheet name</label>
+          <input id="sheetInput" type="text" value="Sheet1" />
+
+          <label>Start cell</label>
+          <input id="startCellInput" type="text" value="A1" />
+
+          <h3>Paste Studio</h3>
+          <textarea
+            id="pasteInput"
+            class="paste-area"
+            placeholder="Paste CSV, TSV, markdown table, or free-form text here..."
+          ></textarea>
+
+          <div class="stack-actions">
+            <button id="previewBtn" class="btn btn-ghost" type="button">Preview Parse</button>
+            <button id="pasteExcelBtn" class="btn btn-primary" type="button">Paste to Active Excel Selection</button>
+            <button id="pasteServerBtn" class="btn btn-secondary" type="button">Paste to Workbook on Server</button>
+          </div>
+
+          <h3>OCR from Image</h3>
+          <input id="imageInput" type="file" accept="image/*" hidden />
+          <div class="stack-actions">
+            <button id="ocrBtn" class="btn btn-ghost" type="button">Extract Text from Image</button>
+            <button id="ocrToExcelBtn" class="btn btn-secondary" type="button">OCR and Paste to Active Selection</button>
+            <button id="ocrToServerBtn" class="btn btn-secondary" type="button">OCR and Paste to Server Workbook</button>
+          </div>
+          <p id="ocrStatus" class="micro-status">OCR idle.</p>
+
+          <div id="previewGrid" class="preview-grid"></div>
+          <p id="actionStatus" class="micro-status">Ready.</p>
+        </aside>
+      </main>
+    </div>
+
+    <script src="/ui/taskpane.js"></script>
+  </body>
+</html>

@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: smart-excel-copilot
+    env: docker
+    plan: starter
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    disks:
+      - name: excel-data
+        mountPath: /data
+        sizeGB: 1
+    envVars:
+      - key: OLLAMA_BASE_URL
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_MODEL
+        value: deepseek-v3.2:cloud
+      - key: EXCEL_FILES_PATH
+        value: /data/excel_files
+      - key: WEBAPP_HOST
+        value: 0.0.0.0

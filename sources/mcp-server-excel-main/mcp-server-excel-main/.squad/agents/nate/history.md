@@ -1,0 +1,25 @@
+# Nate — History
+
+## Core Context
+
+- **Project:** A Windows COM interop MCP server and CLI for programmatic Excel automation with 25 tools and 225 operations.
+- **Role:** Tester
+- **Joined:** 2026-03-15T10:42:22.623Z
+- **Testing posture:** Start by checking the live tool surface and distinguishing real product gaps from discoverability/documentation gaps before calling something a defect.
+- **Stability posture:** Synthetic serial-workflow controls can prove the ComInterop/session layer is healthy, but real lingering-Excel bugs may only reproduce with real workbooks and external-data failure modes.
+- **LLM test posture:** Many early-April failures were harness or test-authoring problems, not product defects; calculation-mode tests should assert workflow completion, and pytest-skill-engineering v0.5.9 can fail by planning without ever executing tools.
+
+## Learnings
+
+<!-- Append learnings below -->
+- 2026-04-02: **Pre-commit deliverable coverage must mirror all five release build families, not just smoke tests plus VS Code packaging.** Release.yml proves the releasable surfaces are (1) CLI publish+NuGet+ZIP, (2) MCP Server publish+NuGet+ZIP, (3) VS Code `npm run package`, (4) MCPB via `mcpb\Build-McpBundle.ps1`, and (5) agent skills packaging (`dotnet build -c Release` plus the release.yml ZIP/npm package staging). Tester verdict: anything less is not true “all deliverables” coverage. Separate blocker still present: `scripts\Test-CliWorkflow.ps1` is red on current HEAD because the `rangeformat format-ranges` step times out the service and cascades into session-close failures, so even a correct deliverable gate would not currently yield a green pre-commit.
+- 2026-04-02: **VS Code extension release mismatch only trips at packaging, not install/compile.** For `vscode-extension`, both `npm install` and `npm run compile` passed while `npm run package` failed immediately with `@types/vscode ^1.110.0 greater than engines.vscode ^1.109.0`. Tester verdict: pre-commit coverage is insufficient unless it includes the extension packaging path itself (or an equivalent `vsce package` validation), because lighter checks do not prove the manifest is releasable.
+- 2026-03-31: **Claude Desktop Reproduction Plan for Issue #585.** Analyzed MCPB bundle architecture, MCP protocol layer, and regression test coverage for `range_format.format-range` failure in v1.8.40. Plan is minimal and trustworthy: install latest .mcpb from release, prompt Claude to format range A1:J1 with bold + dark blue fill + white font in a new workbook, and expect success on current HEAD. Regression tests in both MCP and CLI layers now pass, confirming the fix above v1.8.40.
+- 2026-03-31: Issue #585 (`range_format format-range` failing via MCP in v1.8.40) does not reproduce on current HEAD; focused MCP protocol coverage with the exact reported payload passes and round-trips persisted formatting, so treat it as a version-specific regression already fixed above the current branch.
+- 2026-04-01: **Worksheet parameter discoverability bug isolated at MCP schema layer.** Added a red MCP integration test proving the `worksheet` tool published rename/create parameters without schema descriptions, so Claude/Desktop clients could not reliably infer the correct workflow even when runtime aliases existed.
+- 2026-04-01: **#585 and #587 validation closed green on current HEAD.** Focused MCP coverage passes for worksheet schema contract fixes and the exact #585 formatting payload, and the Claude Desktop evidence round-trips the saved workbook with the expected rename and formatting state.
+- 2026-04-02: **LLM test suite execution with refreshed dependencies (pytest-skill-engineering 0.5.9).** MCP collection succeeded (58 tests: 33 MCP, 25 CLI), but targeted execution still showed expensive timeouts and harness-side failures, reinforcing the need for selective tiered runs.
+- 2026-04-02: **MCP LLM workflow failure investigation.** Classified the observed failures as incomplete test implementations, timeout configuration, or expectation drift; zero failures mapped to confirmed ExcelMcp product bugs.
+- 2026-04-02: **LLM test harness repairs completed.** Fixed missing prompt/execution paths and assertion drift, then confirmed the remaining failure mode was harness regression (`Tools called: none`), not product behavior.
+- 2026-04-02: **Diagnostics parity for issue #585 is safest as an additive contract.** Keep CLI/MCP failure payloads backward-compatible by preserving `error` while adding `errorMessage`, `isError`, `exceptionType`, `hresult`, and `innerError`. To make that parity durable, enrich the shared `ServiceResponse` transport itself; otherwise MCP can expose richer failures than CLI even when both wrap the same service error.
+- 2026-04-02: **Team closeout for the first diagnostics slice.** Targeted CLI/MCP parity and protocol buckets are green with the additive shared-transport contract. Broader full-class MCP runs still show pre-existing `ProgramTransport` / session flake noise, so focused slices remain the trustworthy gate for this milestone.

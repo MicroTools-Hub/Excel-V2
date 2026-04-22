@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+  xsi:type="TaskPaneApp">
+
+  <Id>9d4f4264-6577-4f83-8f8e-d7af745f1bb5</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>Smart Excel Copilot</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="Smart Excel Copilot"/>
+  <Description DefaultValue="ChatGPT-style Excel add-in powered by DeepSeek v3.2 via Ollama."/>
+  <IconUrl DefaultValue="https://excel-v2.onrender.com/ui/assets/icon-32.png"/>
+  <HighResolutionIconUrl DefaultValue="https://excel-v2.onrender.com/ui/assets/icon-80.png"/>
+  <SupportUrl DefaultValue="https://excel-v2.onrender.com"/>
+
+  <AppDomains>
+    <AppDomain>https://excel-v2.onrender.com</AppDomain>
+    <AppDomain>https://localhost:3000</AppDomain>
+  </AppDomains>
+
+  <Hosts>
+    <Host Name="Workbook"/>
+  </Hosts>
+
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://excel-v2.onrender.com/ui/taskpane.html"/>
+  </DefaultSettings>
+
+  <Permissions>ReadWriteDocument</Permissions>
+
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Hosts>
+      <Host xsi:type="Workbook">
+        <DesktopFormFactor>
+          <GetStarted>
+            <Title resid="GetStarted.Title"/>
+            <Description resid="GetStarted.Description"/>
+            <LearnMoreUrl resid="GetStarted.LearnMoreUrl"/>
+          </GetStarted>
+
+          <FunctionFile resid="Commands.Url"/>
+
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="SmartExcelCopilot.Group">
+                <Label resid="Group.Label"/>
+                <Icon>
+                  <bt:Image size="16" resid="Icon.16"/>
+                  <bt:Image size="32" resid="Icon.32"/>
+                  <bt:Image size="80" resid="Icon.80"/>
+                </Icon>
+                <Control xsi:type="Button" id="SmartExcelCopilot.OpenTaskpane">
+                  <Label resid="Button.Label"/>
+                  <Supertip>
+                    <Title resid="Button.Label"/>
+                    <Description resid="Button.Tooltip"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Icon.16"/>
+                    <bt:Image size="32" resid="Icon.32"/>
+                    <bt:Image size="80" resid="Icon.80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>SmartExcelCopilotPane</TaskpaneId>
+                    <SourceLocation resid="Taskpane.Url"/>
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+
+    <Resources>
+      <bt:Images>
+        <bt:Image id="Icon.16" DefaultValue="https://excel-v2.onrender.com/ui/assets/icon-32.png"/>
+        <bt:Image id="Icon.32" DefaultValue="https://excel-v2.onrender.com/ui/assets/icon-32.png"/>
+        <bt:Image id="Icon.80" DefaultValue="https://excel-v2.onrender.com/ui/assets/icon-80.png"/>
+      </bt:Images>
+
+      <bt:Urls>
+        <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://excel-v2.onrender.com"/>
+        <bt:Url id="Commands.Url" DefaultValue="https://excel-v2.onrender.com/ui/commands.html"/>
+        <bt:Url id="Taskpane.Url" DefaultValue="https://excel-v2.onrender.com/ui/taskpane.html"/>
+      </bt:Urls>
+
+      <bt:ShortStrings>
+        <bt:String id="GetStarted.Title" DefaultValue="Get started with Smart Excel Copilot"/>
+        <bt:String id="Group.Label" DefaultValue="Smart Copilot"/>
+        <bt:String id="Button.Label" DefaultValue="Open Copilot"/>
+      </bt:ShortStrings>
+
+      <bt:LongStrings>
+        <bt:String id="GetStarted.Description" DefaultValue="Open the task pane to chat with DeepSeek and paste typed or OCR data into Excel."/>
+        <bt:String id="Button.Tooltip" DefaultValue="Open Smart Excel Copilot task pane"/>
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>

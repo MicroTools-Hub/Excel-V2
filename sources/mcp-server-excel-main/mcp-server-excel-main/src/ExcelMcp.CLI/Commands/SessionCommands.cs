@@ -1,0 +1,216 @@
+using System.ComponentModel;
+using System.Text.Json;
+using Sbroenne.ExcelMcp.CLI.Infrastructure;
+using Sbroenne.ExcelMcp.Service;
+using Spectre.Console.Cli;
+
+namespace Sbroenne.ExcelMcp.CLI.Commands;
+
+// ============================================================================
+// SESSION COMMANDS
+// ============================================================================
+
+internal sealed class SessionCreateCommand : AsyncCommand<SessionCreateCommand.Settings>
+{
+    public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(settings.FilePath))
+        {
+            return CliErrorOutput.WriteError("File path is required.");
+        }
+
+        using var client = await DaemonAutoStart.EnsureAndConnectAsync(cancellationToken);
+        var response = await client.SendAsync(new ServiceRequest
+        {
+            Command = "session.create",
+            Args = JsonSerializer.Serialize(new
+            {
+                filePath = settings.FilePath,
+                show = settings.Show,
+                timeoutSeconds = settings.TimeoutSeconds
+            }, ServiceProtocol.JsonOptions)
+        }, cancellationToken);
+
+        if (response.Success)
+        {
+            Console.WriteLine(response.Result);
+            return 0;
+        }
+        else
+        {
+            return CliErrorOutput.WriteServiceError(response);
+        }
+    }
+
+    internal sealed class Settings : CommandSettings
+    {
+        [CommandArgument(0, "<FILE>")]
+        [Description("Path to the new Excel file to create")]
+        public string FilePath { get; init; } = string.Empty;
+
+        [CommandOption("--timeout <SECONDS>")]
+        [Description("Session timeout in seconds")]
+        public int? TimeoutSeconds { get; init; }
+
+        [CommandOption("--show")]
+        [Description("Show the Excel window for IRM/auth prompts instead of running hidden")]
+        public bool Show { get; init; }
+    }
+}
+
+internal sealed class SessionOpenCommand : AsyncCommand<SessionOpenCommand.Settings>
+{
+    public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(settings.FilePath))
+        {
+            return CliErrorOutput.WriteError("File path is required.");
+        }
+
+        using var client = await DaemonAutoStart.EnsureAndConnectAsync(cancellationToken);
+        var response = await client.SendAsync(new ServiceRequest
+        {
+            Command = "session.open",
+            Args = JsonSerializer.Serialize(new
+            {
+                filePath = settings.FilePath,
+                show = settings.Show,
+                timeoutSeconds = settings.TimeoutSeconds
+            }, ServiceProtocol.JsonOptions)
+        }, cancellationToken);
+
+        if (response.Success)
+        {
+            Console.WriteLine(response.Result);
+            return 0;
+        }
+        else
+        {
+            return CliErrorOutput.WriteServiceError(response);
+        }
+    }
+
+    internal sealed class Settings : CommandSettings
+    {
+        [CommandArgument(0, "<FILE>")]
+        [Description("Path to the Excel file to open")]
+        public string FilePath { get; init; } = string.Empty;
+
+        [CommandOption("--timeout <SECONDS>")]
+        [Description("Session timeout in seconds")]
+        public int? TimeoutSeconds { get; init; }
+
+        [CommandOption("--show")]
+        [Description("Show the Excel window for IRM/auth prompts instead of running hidden")]
+        public bool Show { get; init; }
+    }
+}
+
+internal sealed class SessionCloseCommand : AsyncCommand<SessionCloseCommand.Settings>
+{
+    public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(settings.SessionId))
+        {
+            return CliErrorOutput.WriteError("Session ID is required.");
+        }
+
+        using var client = await DaemonAutoStart.EnsureAndConnectAsync(cancellationToken);
+        var response = await client.SendAsync(new ServiceRequest
+        {
+            Command = "session.close",
+            SessionId = settings.SessionId,
+            Args = JsonSerializer.Serialize(new { save = settings.Save }, ServiceProtocol.JsonOptions)
+        }, cancellationToken);
+
+        if (response.Success)
+        {
+            Console.WriteLine(JsonSerializer.Serialize(new { success = true, message = settings.Save ? "Session closed and saved." : "Session closed." }, ServiceProtocol.JsonOptions));
+            return 0;
+        }
+        else
+        {
+            return CliErrorOutput.WriteServiceError(response);
+        }
+    }
+
+    internal sealed class Settings : CommandSettings
+    {
+        [CommandOption("-s|--session <SESSION>")]
+        [Description("Session ID to close")]
+        public string SessionId { get; init; } = string.Empty;
+
+        [CommandOption("--save")]
+        [Description("Save changes before closing")]
+        public bool Save { get; init; }
+    }
+}
+
+internal sealed class SessionListCommand : AsyncCommand
+{
+    private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(2);
+
+    public override async Task<int> ExecuteAsync(CommandContext context, CancellationToken cancellationToken)
+    {
+        var pipeName = DaemonAutoStart.GetPipeName();
+        using var client = new ServiceClient(pipeName, connectTimeout: CommandTimeout, requestTimeout: CommandTimeout);
+
+        try
+        {
+            var response = await client.SendAsync(new ServiceRequest { Command = "session.list" }, cancellationToken);
+            if (response.Success)
+            {
+                Console.WriteLine(response.Result);
+                return 0;
+            }
+            else
+            {
+                return CliErrorOutput.WriteServiceError(response);
+            }
+        }
+        catch (Exception)
+        {
+            // Daemon not running — no sessions
+            Console.WriteLine(JsonSerializer.Serialize(new { sessions = Array.Empty<object>() }, ServiceProtocol.JsonOptions));
+            return 0;
+        }
+    }
+}
+
+internal sealed class SessionSaveCommand : AsyncCommand<SessionSaveCommand.Settings>
+{
+    public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(settings.SessionId))
+        {
+            return CliErrorOutput.WriteError("Session ID is required.");
+        }
+
+        using var client = await DaemonAutoStart.EnsureAndConnectAsync(cancellationToken);
+        var response = await client.SendAsync(new ServiceRequest
+        {
+            Command = "session.save",
+            SessionId = settings.SessionId
+        }, cancellationToken);
+
+        if (response.Success)
+        {
+            Console.WriteLine(JsonSerializer.Serialize(new { success = true, message = "Session saved." }, ServiceProtocol.JsonOptions));
+            return 0;
+        }
+        else
+        {
+            return CliErrorOutput.WriteServiceError(response);
+        }
+    }
+
+    internal sealed class Settings : CommandSettings
+    {
+        [CommandOption("-s|--session <SESSION>")]
+        [Description("Session ID to save")]
+        public string SessionId { get; init; } = string.Empty;
+    }
+}
+
+
+
