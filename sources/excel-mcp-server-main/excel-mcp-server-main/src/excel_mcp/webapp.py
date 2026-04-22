@@ -372,6 +372,8 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "model": os.environ.get("OLLAMA_MODEL", "deepseek-v3.2:cloud"),
+        "ollama_base_url": os.environ.get("OLLAMA_BASE_URL", "https://ollama.com"),
+        "ollama_api_key_configured": bool(os.environ.get("OLLAMA_API_KEY")),
         "excel_files_path": EXCEL_FILES_BASE,
     }
 
@@ -395,7 +397,13 @@ def taskpane() -> Any:
 async def chat(request: ChatRequest) -> Dict[str, Any]:
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages cannot be empty")
-    return await _run_llm_chat(request)
+    try:
+        return await _run_llm_chat(request)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Chat request failed: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/tool-call")

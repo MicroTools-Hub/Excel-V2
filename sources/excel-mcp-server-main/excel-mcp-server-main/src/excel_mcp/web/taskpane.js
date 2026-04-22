@@ -364,8 +364,14 @@ async function sendChat() {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(errorText || "Chat request failed");
+      let errorText = "";
+      try {
+        const payload = await response.json();
+        errorText = payload && payload.detail ? String(payload.detail) : JSON.stringify(payload);
+      } catch (_err) {
+        errorText = await response.text();
+      }
+      throw new Error(errorText || `Chat request failed (${response.status})`);
     }
 
     const data = await response.json();
