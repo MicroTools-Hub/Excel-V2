@@ -180,7 +180,10 @@ function getRangeStartCell(rangeAddress) {
   if (typeof rangeAddress !== "string" || !rangeAddress.trim()) {
     return "A1";
   }
-  return rangeAddress.split(":")[0].trim() || "A1";
+  const rawStart = rangeAddress.split(":")[0].trim();
+  const noSheet = rawStart.includes("!") ? rawStart.split("!").pop() : rawStart;
+  const normalized = (noSheet || "").replace(/\$/g, "").trim();
+  return normalized || "A1";
 }
 
 function getActiveWorksheet(context) {
@@ -201,6 +204,51 @@ async function resolveWorksheet(context, sheetName) {
   }
 
   return candidate;
+}
+
+async function collectExcelSheetSnapshot() {
+  if (!state.isExcelHost || !window.Excel || !window.Office) {
+    return null;
+  }
+
+  return Excel.run(async (context) => {
+    const workbook = context.workbook;
+    const activeSheet = workbook.worksheets.getActiveWorksheet();
+    const selectedRange = workbook.getSelectedRange();
+    const usedRange = activeSheet.getUsedRangeOrNullObject(true);
+
+    activeSheet.load("name");
+    selectedRange.load("address");
+    usedRange.load("isNullObject,address,rowCount,columnCount,values,formulas");
+    await context.sync();
+
+    const selectionAddress = selectedRange.address || "A1";
+    const selectionStartCell = getRangeStartCell(selectionAddress);
+
+    if (usedRange.isNullObject) {
+      return {
+        sheet_name: activeSheet.name,
+        selection_address: selectionAddress,
+        selection_start_cell: selectionStartCell,
+        used_range_address: null,
+        row_count: 0,
+        column_count: 0,
+        values: [],
+        formulas: [],
+      };
+    }
+
+    return {
+      sheet_name: activeSheet.name,
+      selection_address: selectionAddress,
+      selection_start_cell: selectionStartCell,
+      used_range_address: usedRange.address,
+      row_count: usedRange.rowCount,
+      column_count: usedRange.columnCount,
+      values: usedRange.values,
+      formulas: usedRange.formulas,
+    };
+  });
 }
 
 async function executeOperationsInExcel(operations) {
@@ -352,11 +400,33 @@ async function sendChat() {
   updateStatus(ui.actionStatus, "Thinking...");
 
   const config = getWorkbookConfig();
+  let sheetSnapshot = null;
+
+  if (state.isExcelHost) {
+    try {
+      updateStatus(ui.actionStatus, "Reading full sheet context...");
+      sheetSnapshot = await collectExcelSheetSnapshot();
+    } catch (error) {
+      appendMessage("system", `Warning: Could not read full sheet context: ${error.message}`);
+    }
+  }
+
+  const effectiveSheetName =
+    sheetSnapshot && sheetSnapshot.sheet_name
+      ? String(sheetSnapshot.sheet_name)
+      : (config.sheet_name || null);
+
+  const effectiveStartCell =
+    sheetSnapshot && sheetSnapshot.selection_start_cell
+      ? String(sheetSnapshot.selection_start_cell)
+      : config.start_cell;
+
   const payload = {
     messages: state.messages,
     filepath: config.filepath || null,
-    sheet_name: config.sheet_name || null,
-    start_cell: config.start_cell,
+    sheet_name: effectiveSheetName,
+    start_cell: effectiveStartCell,
+    sheet_snapshot: sheetSnapshot,
     auto_execute: !state.isExcelHost,
   };
 

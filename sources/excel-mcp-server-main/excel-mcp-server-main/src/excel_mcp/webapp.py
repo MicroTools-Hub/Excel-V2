@@ -51,6 +51,7 @@ class ChatRequest(BaseModel):
     filepath: Optional[str] = None
     sheet_name: Optional[str] = None
     start_cell: str = "A1"
+    sheet_snapshot: Optional[Dict[str, Any]] = None
     auto_execute: bool = True
 
 
@@ -461,6 +462,31 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
             )
         except Exception as exc:
             logger.warning("Could not build workbook context: %s", exc)
+
+    if request.sheet_snapshot:
+        try:
+            snapshot_context = {
+                "sheet_name": request.sheet_snapshot.get("sheet_name"),
+                "selection_address": request.sheet_snapshot.get("selection_address"),
+                "selection_start_cell": request.sheet_snapshot.get("selection_start_cell"),
+                "used_range_address": request.sheet_snapshot.get("used_range_address"),
+                "row_count": request.sheet_snapshot.get("row_count"),
+                "column_count": request.sheet_snapshot.get("column_count"),
+                "values": request.sheet_snapshot.get("values", []),
+                "formulas": request.sheet_snapshot.get("formulas", []),
+            }
+            model_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Live active-sheet snapshot from Excel host (full used range). "
+                        "Treat this as the source of truth for current sheet state: "
+                        + json.dumps(snapshot_context, default=str)
+                    ),
+                }
+            )
+        except Exception as exc:
+            logger.warning("Could not attach sheet snapshot context: %s", exc)
 
     for msg in request.messages[-24:]:
         model_messages.append({"role": msg.role, "content": msg.content})
