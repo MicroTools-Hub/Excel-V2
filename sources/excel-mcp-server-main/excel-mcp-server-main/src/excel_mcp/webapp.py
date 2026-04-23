@@ -169,6 +169,38 @@ def _summarize_sheet(filepath: str, sheet_name: str) -> Dict[str, Any]:
     }
 
 
+def _compact_sheet_snapshot(snapshot: Dict[str, Any], max_rows: int = 120, max_cols: int = 20) -> Dict[str, Any]:
+    def trim_matrix(matrix: Any) -> List[List[Any]]:
+        if not isinstance(matrix, list):
+            return []
+        trimmed: List[List[Any]] = []
+        for row in matrix[:max_rows]:
+            if isinstance(row, list):
+                trimmed.append(row[:max_cols])
+            else:
+                trimmed.append([row])
+        return trimmed
+
+    row_count = int(snapshot.get("row_count") or 0)
+    col_count = int(snapshot.get("column_count") or 0)
+    truncated = row_count > max_rows or col_count > max_cols
+
+    return {
+        "sheet_name": snapshot.get("sheet_name"),
+        "selection_address": snapshot.get("selection_address"),
+        "selection_start_cell": snapshot.get("selection_start_cell"),
+        "used_range_address": snapshot.get("used_range_address"),
+        "row_count": row_count,
+        "column_count": col_count,
+        "snapshot_mode": "compact",
+        "truncated": truncated,
+        "max_rows": max_rows,
+        "max_cols": max_cols,
+        "values": trim_matrix(snapshot.get("values", [])),
+        "formulas": trim_matrix(snapshot.get("formulas", [])),
+    }
+
+
 def _is_valid_cell_ref(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -436,6 +468,7 @@ def _execute_operation(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
     llm = OllamaClient()
+    used_compact_snapshot_fallback = False
 
     system_content = (
         "You are Excel Copilot running on top of DeepSeek via Ollama. "
@@ -491,7 +524,37 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
     for msg in request.messages[-24:]:
         model_messages.append({"role": msg.role, "content": msg.content})
 
-    llm_response = await llm.chat(model_messages)
+    try:
+        llm_response = await llm.chat(model_messages)
+    except Exception as exc:
+        message = str(exc)
+        timeout_like = "readtimeout" in message.lower() or "timed out" in message.lower()
+        if request.sheet_snapshot and timeout_like:
+            logger.warning("Full sheet snapshot timed out; retrying with compact snapshot: %s", message)
+            compact_snapshot = _compact_sheet_snapshot(request.sheet_snapshot)
+            compact_messages = [
+                m
+                for m in model_messages
+                if not (
+                    m.get("role") == "system"
+                    and isinstance(m.get("content"), str)
+                    and m["content"].startswith("Live active-sheet snapshot from Excel host")
+                )
+            ]
+            compact_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Full active-sheet snapshot call timed out upstream. "
+                        "Use this compact snapshot to respond quickly and safely: "
+                        + json.dumps(compact_snapshot, default=str)
+                    ),
+                }
+            )
+            llm_response = await llm.chat(compact_messages)
+            used_compact_snapshot_fallback = True
+        else:
+            raise
     raw_text = llm_response["content"]
     plan = _extract_json_payload(raw_text)
 
@@ -530,6 +593,11 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
             "rejected": rejected_count,
         },
         "operation_validation_warnings": validation_warnings,
+        "sheet_context_mode": (
+            "compact-fallback"
+            if used_compact_snapshot_fallback
+            else ("full" if bool(request.sheet_snapshot) else "none")
+        ),
     }
 
 
@@ -556,10 +624,12 @@ def _ocr_image_to_text(image_base64: str) -> str:
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
+    model = (os.environ.get("OLLAMA_MODEL") or "deepseek-v3.2:cloud").strip()
+    base = (os.environ.get("OLLAMA_BASE_URL") or "https://ollama.com").strip()
     return {
         "status": "ok",
-        "model": os.environ.get("OLLAMA_MODEL", "deepseek-v3.2:cloud"),
-        "ollama_base_url": os.environ.get("OLLAMA_BASE_URL", "https://ollama.com"),
+        "model": model,
+        "ollama_base_url": base,
         "ollama_api_key_configured": bool(os.environ.get("OLLAMA_API_KEY")),
         "excel_files_path": EXCEL_FILES_BASE,
     }

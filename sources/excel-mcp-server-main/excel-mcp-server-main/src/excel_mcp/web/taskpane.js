@@ -466,6 +466,10 @@ async function sendChat() {
       executionSuffix += `\nValidation warnings: ${data.operation_validation_warnings.slice(0, 2).join(" ")}`;
     }
 
+    if (data.sheet_context_mode === "compact-fallback") {
+      executionSuffix += "\nSheet context fallback: full-sheet snapshot timed out, compact context used.";
+    }
+
     appendMessage("assistant", `${data.reply || "No response"}${executionSuffix}`);
     state.messages.push({ role: "assistant", content: data.reply || "" });
 
