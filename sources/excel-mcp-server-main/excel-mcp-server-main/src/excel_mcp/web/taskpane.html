@@ -12,7 +12,6 @@
     />
     <link rel="stylesheet" href="/ui/taskpane.css" />
     <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   </head>
   <body>
     <div class="bg-orb bg-orb-a"></div>
@@ -68,12 +67,12 @@
             <button id="pasteServerBtn" class="btn btn-secondary" type="button">Paste to Workbook on Server</button>
           </div>
 
-          <h3>OCR from Image</h3>
+          <h3>AI OCR from Image</h3>
           <input id="imageInput" type="file" accept="image/*" hidden />
           <div class="stack-actions">
-            <button id="ocrBtn" class="btn btn-ghost" type="button">Extract Text from Image</button>
-            <button id="ocrToExcelBtn" class="btn btn-secondary" type="button">OCR and Paste to Active Selection</button>
-            <button id="ocrToServerBtn" class="btn btn-secondary" type="button">OCR and Paste to Server Workbook</button>
+            <button id="ocrBtn" class="btn btn-ghost" type="button">Extract Structured Table from Image</button>
+            <button id="ocrToExcelBtn" class="btn btn-secondary" type="button">OCR Table to Active Selection</button>
+            <button id="ocrToServerBtn" class="btn btn-secondary" type="button">OCR Table to Server Workbook</button>
           </div>
           <p id="ocrStatus" class="micro-status">OCR idle.</p>
 

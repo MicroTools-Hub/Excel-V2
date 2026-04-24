@@ -291,6 +291,26 @@ async function executeOperationsInExcel(operations) {
         continue;
       }
 
+      if (opName === "read_data") {
+        const rangeAddress = resolveRangeAddress(args);
+        const range = sheet.getRange(rangeAddress);
+        range.load("values");
+        await context.sync();
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "get_workbook_metadata") {
+        const worksheets = context.workbook.worksheets;
+        worksheets.load("items/name");
+        const activeSheet = context.workbook.worksheets.getActiveWorksheet();
+        const used = activeSheet.getUsedRangeOrNullObject(true);
+        used.load("isNullObject,address,rowCount,columnCount");
+        await context.sync();
+        executed += 1;
+        continue;
+      }
+
       if (opName === "apply_formula") {
         const formula = typeof args.formula === "string" ? args.formula : "";
         if (!formula) {
@@ -541,31 +561,103 @@ function pickImageFile() {
   });
 }
 
-async function runOcrFlow() {
-  if (!window.Tesseract) {
-    throw new Error("Tesseract.js failed to load");
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Failed to read selected image"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function rowsToTsv(rows) {
+  if (!Array.isArray(rows) || !rows.length) {
+    return "";
   }
 
-  const file = await pickImageFile();
-  updateStatus(ui.ocrStatus, "OCR running...");
+  return rows
+    .map((row) => {
+      const cells = Array.isArray(row) ? row : [row];
+      return cells.map((cell) => String(cell ?? "")).join("\t");
+    })
+    .join("\n");
+}
 
-  const result = await window.Tesseract.recognize(file, "eng", {
-    logger: (info) => {
-      if (info && typeof info.progress === "number") {
-        const percent = Math.round(info.progress * 100);
-        updateStatus(ui.ocrStatus, `OCR ${percent}% (${info.status || "working"})`);
-      }
-    },
+async function requestServerOcr(imageBase64) {
+  const response = await fetch("/api/ocr-text", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      image_base64: imageBase64,
+      use_ai_layout: true,
+    }),
   });
 
-  const text = result.data && result.data.text ? result.data.text.trim() : "";
-  ui.pasteInput.value = text;
-  const rows = parseTabularText(text);
+  if (!response.ok) {
+    const payload = await response.text();
+    throw new Error(payload || `OCR request failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+async function pasteOcrImageToServerWorkbook(imageBase64) {
+  const config = getWorkbookConfig();
+  if (!config.filepath || !config.sheet_name) {
+    throw new Error("Workbook file and sheet name are required for server OCR paste");
+  }
+
+  const response = await fetch("/api/paste-ocr", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filepath: config.filepath,
+      sheet_name: config.sheet_name,
+      start_cell: config.start_cell,
+      image_base64: imageBase64,
+      use_ai_layout: true,
+    }),
+  });
+
+  if (!response.ok) {
+    const payload = await response.text();
+    throw new Error(payload || `OCR paste failed (${response.status})`);
+  }
+
+  return response.json();
+}
+
+async function runOcrFlow() {
+  const file = await pickImageFile();
+  updateStatus(ui.ocrStatus, "Preparing image for OCR...");
+  const imageBase64 = await fileToDataUrl(file);
+
+  updateStatus(ui.ocrStatus, "Analyzing image layout with AI OCR...");
+  const payload = await requestServerOcr(imageBase64);
+
+  const serverRows = Array.isArray(payload.rows) ? payload.rows : [];
+  const rows = serverRows.length
+    ? normalizeRows(
+      serverRows.map((row) =>
+        (Array.isArray(row) ? row.map((cell) => String(cell ?? "")) : [String(row ?? "")])
+      )
+    )
+    : parseTabularText(String(payload.text || ""));
+
   state.parsedRows = rows;
+  ui.pasteInput.value = rows.length ? rowsToTsv(rows) : String(payload.text || "");
   renderPreview(rows);
 
-  updateStatus(ui.ocrStatus, `OCR complete. Extracted ${text.length} chars.`);
-  return rows;
+  const source = payload.layout_source ? String(payload.layout_source) : "text";
+  const cols = rows.length ? rows[0].length : 0;
+  const lines = Number.isFinite(payload.line_count) ? Number(payload.line_count) : 0;
+  updateStatus(ui.ocrStatus, `OCR complete (${source}). ${rows.length} rows x ${cols} cols from ${lines} lines.`);
+
+  return {
+    rows,
+    imageBase64,
+    payload,
+  };
 }
 
 function bindEvents() {
@@ -624,9 +716,9 @@ function bindEvents() {
 
   ui.ocrToExcelBtn.addEventListener("click", async () => {
     try {
-      const rows = await runOcrFlow();
-      await pasteToActiveSelection(rows);
-      updateStatus(ui.actionStatus, "OCR text pasted to active Excel selection.");
+      const ocrResult = await runOcrFlow();
+      await pasteToActiveSelection(ocrResult.rows);
+      updateStatus(ui.actionStatus, "OCR table pasted to active Excel selection.");
     } catch (error) {
       updateStatus(ui.actionStatus, error.message, true);
     }
@@ -634,9 +726,12 @@ function bindEvents() {
 
   ui.ocrToServerBtn.addEventListener("click", async () => {
     try {
-      const rows = await runOcrFlow();
-      const payload = await pasteToServerWorkbook(rows);
-      updateStatus(ui.actionStatus, payload.message || "OCR text pasted to server workbook.");
+      const ocrResult = await runOcrFlow();
+      const payload = await pasteOcrImageToServerWorkbook(ocrResult.imageBase64);
+      updateStatus(
+        ui.actionStatus,
+        payload.message || `OCR pasted ${payload.rows_written || 0} rows x ${payload.columns_written || 0} cols to server workbook.`
+      );
     } catch (error) {
       updateStatus(ui.actionStatus, error.message, true);
     }

@@ -4,11 +4,13 @@ import json
 import logging
 import os
 import re
+import statistics
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import inspect
 
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -73,6 +75,7 @@ class ParseTextRequest(BaseModel):
 
 class OcrRequest(BaseModel):
     image_base64: str
+    use_ai_layout: bool = True
 
 
 class OcrPasteRequest(BaseModel):
@@ -80,6 +83,7 @@ class OcrPasteRequest(BaseModel):
     sheet_name: str
     start_cell: str = "A1"
     image_base64: str
+    use_ai_layout: bool = True
 
 
 EXCEL_FILES_BASE = os.path.realpath(os.environ.get("EXCEL_FILES_PATH", "./excel_files"))
@@ -214,12 +218,19 @@ def _is_valid_range_ref(value: Any) -> bool:
 
 
 def _merge_operation_defaults(args: Dict[str, Any], request: ChatRequest) -> Dict[str, Any]:
+    def is_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str) and not value.strip():
+            return True
+        return False
+
     merged = dict(args)
-    if request.filepath and "filepath" not in merged:
+    if request.filepath and ("filepath" not in merged or is_missing(merged.get("filepath"))):
         merged["filepath"] = request.filepath
-    if request.sheet_name and "sheet_name" not in merged:
+    if request.sheet_name and ("sheet_name" not in merged or is_missing(merged.get("sheet_name"))):
         merged["sheet_name"] = request.sheet_name
-    if request.start_cell and "start_cell" not in merged:
+    if request.start_cell and ("start_cell" not in merged or is_missing(merged.get("start_cell"))):
         merged["start_cell"] = request.start_cell
     return merged
 
@@ -273,10 +284,17 @@ def _validate_operation_pass_two(name: str, args: Dict[str, Any], request: ChatR
         elif os.path.isabs(filepath):
             errors.append("filepath must be relative, not absolute")
 
-    if "sheet_name" in args and (
-        not isinstance(args.get("sheet_name"), str) or not str(args.get("sheet_name")).strip()
-    ):
-        errors.append("sheet_name must be a non-empty string")
+    # In Excel-host mode (auto_execute=False), local execution can default to active sheet.
+    if request.auto_execute and name in {
+        "create_worksheet",
+        "write_data",
+        "clear_range",
+        "read_data",
+        "apply_formula",
+        "format_range",
+    }:
+        if not isinstance(args.get("sheet_name"), str) or not str(args.get("sheet_name")).strip():
+            errors.append("sheet_name must be a non-empty string")
 
     if "start_cell" in args and args.get("start_cell") and not _is_valid_cell_ref(args.get("start_cell")):
         errors.append("start_cell is invalid")
@@ -476,6 +494,8 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
         "When an operation should be executed, include an XML-like plan block exactly in this format: "
         "<excel_plan>{\"assistant_reply\":\"...\",\"operations\":[{\"name\":\"write_data\",\"args\":{...}}]}</excel_plan>. "
         "Before returning operations, internally verify each operation twice for required args and reference validity. "
+        "If the user asks to modify or format data, include at least one actionable operation (for example format_range, write_data, clear_range, or apply_formula). "
+        "When live sheet_snapshot context is present, avoid read_data/get_workbook_metadata unless strictly necessary. "
         "Supported operation names: create_workbook, create_worksheet, write_data, clear_range, read_data, apply_formula, format_range, get_workbook_metadata. "
         "For write_data, prefer args {start_cell, data, optional sheet_name}; use range only when explicitly requested. "
         "For clearing cells, prefer clear_range with args {range, optional sheet_name}. "
@@ -601,10 +621,51 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
     }
 
 
-def _ocr_image_to_text(image_base64: str) -> str:
+def _normalize_table_rows(rows: Any, max_rows: int = 600, max_cols: int = 60) -> List[List[Any]]:
+    if not isinstance(rows, list):
+        return []
+
+    normalized: List[List[Any]] = []
+    for row in rows[:max_rows]:
+        row_values = row if isinstance(row, list) else [row]
+        clean_row: List[Any] = []
+        for cell in row_values[:max_cols]:
+            if cell is None:
+                clean_row.append("")
+            elif isinstance(cell, (int, float, bool)):
+                clean_row.append(cell)
+            else:
+                token = str(cell).replace("\r", " ").strip()
+                clean_row.append(token[:300])
+        if any(str(cell).strip() for cell in clean_row):
+            normalized.append(clean_row)
+
+    if not normalized:
+        return []
+
+    width = max(len(row) for row in normalized)
+    rectangular = [row + [""] * (width - len(row)) for row in normalized]
+
+    last_non_empty_col = -1
+    for col in range(width - 1, -1, -1):
+        if any(str(row[col]).strip() for row in rectangular):
+            last_non_empty_col = col
+            break
+
+    if last_non_empty_col < 0:
+        return []
+
+    return [row[: last_non_empty_col + 1] for row in rectangular]
+
+
+def _median(values: List[float], default: float) -> float:
+    clean = [float(value) for value in values if isinstance(value, (int, float)) and float(value) > 0]
+    return float(statistics.median(clean)) if clean else float(default)
+
+
+def _decode_base64_image(image_base64: str) -> Any:
     try:
-        from PIL import Image
-        import pytesseract
+        from PIL import Image, ImageOps
     except ImportError as exc:
         raise HTTPException(status_code=500, detail="OCR dependencies are not installed") from exc
 
@@ -616,10 +677,453 @@ def _ocr_image_to_text(image_base64: str) -> str:
 
     try:
         image = Image.open(io.BytesIO(image_bytes))
-        text = pytesseract.image_to_string(image)
-        return text.strip()
+        image = ImageOps.exif_transpose(image)
+        image.load()
+        return image
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"OCR processing failed: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Could not decode image: {exc}") from exc
+
+
+def _build_ocr_variants(image: Any) -> List[Tuple[str, Any]]:
+    from PIL import Image, ImageEnhance, ImageOps
+
+    base = image.convert("RGB") if image.mode not in {"RGB", "L"} else image.copy()
+    lanczos = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+
+    def upscale_if_needed(img: Any) -> Any:
+        width, height = img.size
+        min_edge = min(width, height)
+        if min_edge >= 1200:
+            return img
+        scale = min(2.5, 1200.0 / max(1, min_edge))
+        return img.resize((int(width * scale), int(height * scale)), resample=lanczos)
+
+    upscaled = upscale_if_needed(base)
+    gray = ImageOps.grayscale(upscaled)
+    contrast = ImageEnhance.Contrast(gray).enhance(2.0)
+    binary = contrast.point(lambda p: 255 if p > 165 else 0)
+
+    return [
+        ("upscaled", upscaled),
+        ("contrast", contrast),
+        ("binary", binary),
+    ]
+
+
+def _extract_words_from_ocr_data(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    words: List[Dict[str, Any]] = []
+    texts = data.get("text") or []
+
+    for index, raw_text in enumerate(texts):
+        token = str(raw_text).strip()
+        if not token:
+            continue
+
+        def value(name: str, default: Any) -> Any:
+            collection = data.get(name) or []
+            if index < len(collection):
+                return collection[index]
+            return default
+
+        try:
+            left = int(float(value("left", 0)))
+            top = int(float(value("top", 0)))
+            width = int(float(value("width", 0)))
+            height = int(float(value("height", 0)))
+        except Exception:
+            continue
+
+        if width <= 0 or height <= 0:
+            continue
+
+        conf_raw = value("conf", -1)
+        try:
+            conf = float(conf_raw)
+        except Exception:
+            conf = -1.0
+
+        block_num = int(float(value("block_num", 0)))
+        par_num = int(float(value("par_num", 0)))
+        line_num = int(float(value("line_num", 0)))
+
+        words.append(
+            {
+                "text": token,
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height,
+                "right": left + width,
+                "bottom": top + height,
+                "center_x": left + (width / 2.0),
+                "center_y": top + (height / 2.0),
+                "conf": conf,
+                "block_num": block_num,
+                "par_num": par_num,
+                "line_num": line_num,
+            }
+        )
+
+    return words
+
+
+def _group_words_into_rows(word_boxes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not word_boxes:
+        return []
+
+    row_tolerance = max(8.0, _median([float(w["height"]) for w in word_boxes], 14.0) * 0.65)
+    rows: List[Dict[str, Any]] = []
+
+    for word in sorted(word_boxes, key=lambda w: (float(w["center_y"]), int(w["left"]))):
+        best_idx: Optional[int] = None
+        best_distance = float("inf")
+
+        for index, row in enumerate(rows):
+            distance = abs(float(word["center_y"]) - float(row["center_y"]))
+            if distance <= row_tolerance and distance < best_distance:
+                best_idx = index
+                best_distance = distance
+
+        if best_idx is None:
+            rows.append({"center_y": float(word["center_y"]), "words": [word]})
+        else:
+            row = rows[best_idx]
+            row_words = row["words"]
+            row_words.append(word)
+            row["center_y"] = sum(float(item["center_y"]) for item in row_words) / len(row_words)
+
+    return sorted(rows, key=lambda row: float(row["center_y"]))
+
+
+def _segment_row_into_cells(row_words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not row_words:
+        return []
+
+    words = sorted(row_words, key=lambda w: int(w["left"]))
+    widths = [float(w["width"]) for w in words]
+    gaps: List[float] = []
+    for idx in range(1, len(words)):
+        gaps.append(max(0.0, float(words[idx]["left"] - words[idx - 1]["right"])))
+
+    split_threshold = max(
+        12.0,
+        _median(widths, 18.0) * 0.85,
+        _median(gaps, 8.0) * 1.8,
+    )
+
+    cells: List[Dict[str, Any]] = []
+    active: List[Dict[str, Any]] = [words[0]]
+    right_edge = int(words[0]["right"])
+
+    for word in words[1:]:
+        gap = int(word["left"]) - right_edge
+        if gap > split_threshold:
+            text = " ".join(str(item["text"]).strip() for item in active if str(item["text"]).strip()).strip()
+            if text:
+                left = int(active[0]["left"])
+                right = int(max(item["right"] for item in active))
+                width = max(1, right - left)
+                cells.append(
+                    {
+                        "text": text,
+                        "left": left,
+                        "right": right,
+                        "width": width,
+                        "center_x": left + (width / 2.0),
+                    }
+                )
+            active = [word]
+        else:
+            active.append(word)
+        right_edge = max(right_edge, int(word["right"]))
+
+    text = " ".join(str(item["text"]).strip() for item in active if str(item["text"]).strip()).strip()
+    if text:
+        left = int(active[0]["left"])
+        right = int(max(item["right"] for item in active))
+        width = max(1, right - left)
+        cells.append(
+            {
+                "text": text,
+                "left": left,
+                "right": right,
+                "width": width,
+                "center_x": left + (width / 2.0),
+            }
+        )
+
+    return cells
+
+
+def _table_from_word_boxes(word_boxes: List[Dict[str, Any]], image_width: int) -> List[List[Any]]:
+    if not word_boxes:
+        return []
+
+    rows = _group_words_into_rows(word_boxes)
+    cell_rows = [_segment_row_into_cells(row["words"]) for row in rows]
+    all_cells = [cell for row_cells in cell_rows for cell in row_cells if cell.get("text")]
+
+    if not all_cells:
+        return []
+
+    median_cell_width = _median([float(cell["width"]) for cell in all_cells], 20.0)
+    column_tolerance = max(14.0, median_cell_width * 0.85, float(max(1, image_width)) * 0.035)
+
+    anchors: List[Dict[str, Any]] = []
+    for center in sorted(float(cell["center_x"]) for cell in all_cells):
+        matched = False
+        for anchor in anchors:
+            if abs(center - float(anchor["center"])) <= column_tolerance:
+                count = int(anchor["count"]) + 1
+                anchor["center"] = ((float(anchor["center"]) * int(anchor["count"])) + center) / count
+                anchor["count"] = count
+                matched = True
+                break
+        if not matched:
+            anchors.append({"center": center, "count": 1})
+
+    merged_anchors: List[Dict[str, Any]] = []
+    for anchor in sorted(anchors, key=lambda item: float(item["center"])):
+        if not merged_anchors:
+            merged_anchors.append(anchor)
+            continue
+        prev = merged_anchors[-1]
+        if abs(float(anchor["center"]) - float(prev["center"])) <= (column_tolerance * 0.5):
+            total = int(prev["count"]) + int(anchor["count"])
+            prev["center"] = ((float(prev["center"]) * int(prev["count"])) + (float(anchor["center"]) * int(anchor["count"]))) / total
+            prev["count"] = total
+        else:
+            merged_anchors.append(anchor)
+
+    if len(merged_anchors) > 40:
+        top = sorted(merged_anchors, key=lambda item: int(item["count"]), reverse=True)[:40]
+        merged_anchors = sorted(top, key=lambda item: float(item["center"]))
+
+    if len(merged_anchors) <= 1:
+        return []
+
+    table_rows: List[List[Any]] = []
+    for row_cells in cell_rows:
+        if not row_cells:
+            continue
+
+        row_values: List[str] = ["" for _ in merged_anchors]
+        for cell in sorted(row_cells, key=lambda item: float(item["center_x"])):
+            nearest_idx = min(
+                range(len(merged_anchors)),
+                key=lambda idx: abs(float(cell["center_x"]) - float(merged_anchors[idx]["center"])),
+            )
+            text = str(cell.get("text", "")).strip()
+            if not text:
+                continue
+            if row_values[nearest_idx]:
+                row_values[nearest_idx] = f"{row_values[nearest_idx]} {text}".strip()
+            else:
+                row_values[nearest_idx] = text
+
+        if any(value.strip() for value in row_values):
+            table_rows.append(row_values)
+
+    return _normalize_table_rows(table_rows)
+
+
+def _word_boxes_to_text(word_boxes: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for row in _group_words_into_rows(word_boxes):
+        ordered = sorted(row["words"], key=lambda word: int(word["left"]))
+        line = " ".join(str(word.get("text", "")).strip() for word in ordered if str(word.get("text", "")).strip())
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _score_table_candidate(rows: List[List[Any]]) -> float:
+    if not rows:
+        return -1.0
+    width = max(len(row) for row in rows)
+    non_empty = sum(1 for row in rows for cell in row if str(cell).strip())
+    fill_ratio = non_empty / max(1, len(rows) * max(1, width))
+    score = (width * 120.0) + float(non_empty) + (250.0 if width > 1 else 0.0) + (fill_ratio * 30.0)
+    if len(rows) <= 1:
+        score -= 20.0
+    return score
+
+
+def _choose_best_rows(candidates: List[Tuple[str, List[List[Any]]]]) -> Tuple[str, List[List[Any]]]:
+    best_source = "none"
+    best_rows: List[List[Any]] = []
+    best_score = -1.0
+
+    for source, rows in candidates:
+        normalized = _normalize_table_rows(rows)
+        score = _score_table_candidate(normalized)
+        if score > best_score:
+            best_score = score
+            best_source = source
+            best_rows = normalized
+
+    return best_source, best_rows
+
+
+def _extract_rows_payload(text: str) -> List[List[Any]]:
+    payload = _extract_json_payload(text)
+    if not isinstance(payload, dict):
+        return []
+    return _normalize_table_rows(payload.get("rows"))
+
+
+async def _ai_refine_ocr_rows(
+    text: str,
+    word_boxes: List[Dict[str, Any]],
+    initial_rows: List[List[Any]],
+) -> List[List[Any]]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return []
+
+    boxes_preview = [
+        {
+            "text": str(word["text"]),
+            "x": int(word["left"]),
+            "y": int(word["top"]),
+            "w": int(word["width"]),
+            "h": int(word["height"]),
+            "conf": round(float(word["conf"]), 1),
+        }
+        for word in word_boxes[:260]
+    ]
+
+    system_prompt = (
+        "You convert OCR output into clean rectangular Excel tables. "
+        "Infer likely columns even when visual grid lines are missing by using x/y box positions and data patterns. "
+        "Return strict JSON only, with this exact shape: {\"rows\":[[...],[...]]}. "
+        "No markdown, no explanation, no extra keys."
+    )
+    user_prompt = (
+        "Build the best possible table from this OCR output. Preserve row order top-to-bottom. "
+        "Use blank cells when a value is missing to keep column alignment.\n\n"
+        f"OCR text:\n{text[:12000]}\n\n"
+        f"OCR boxes sample (first {len(boxes_preview)} words):\n{json.dumps(boxes_preview, ensure_ascii=True)}\n\n"
+        f"Initial heuristic rows:\n{json.dumps(initial_rows[:80], ensure_ascii=True)}"
+    )
+
+    try:
+        llm = OllamaClient(timeout_seconds=90)
+        response = await llm.chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+        )
+        return _extract_rows_payload(response.get("content", ""))
+    except Exception as exc:
+        logger.warning("AI OCR refinement failed: %s", exc)
+        return []
+
+
+def _run_tesseract_ocr(image_base64: str) -> Dict[str, Any]:
+    try:
+        import pytesseract
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="OCR dependencies are not installed") from exc
+
+    image = _decode_base64_image(image_base64)
+    variants = _build_ocr_variants(image)
+    psm_values = [6, 11]
+
+    best: Optional[Dict[str, Any]] = None
+    attempts: List[str] = []
+
+    for variant_name, variant_image in variants:
+        for psm in psm_values:
+            config = f"--oem 3 --psm {psm} -c preserve_interword_spaces=1"
+            try:
+                data = pytesseract.image_to_data(variant_image, config=config, output_type=pytesseract.Output.DICT)
+            except Exception as exc:
+                attempts.append(f"{variant_name}/psm{psm}: {exc}")
+                continue
+
+            words = _extract_words_from_ocr_data(data)
+            if not words:
+                attempts.append(f"{variant_name}/psm{psm}: no words")
+                continue
+
+            good_words = sum(1 for word in words if float(word["conf"]) >= 35.0)
+            line_keys = {
+                (int(word["block_num"]), int(word["par_num"]), int(word["line_num"]))
+                for word in words
+            }
+            score = (good_words * 3.0) + (len(words) * 1.2) + (len(line_keys) * 2.0)
+
+            if best is None or score > float(best["score"]):
+                best = {
+                    "score": score,
+                    "variant": variant_name,
+                    "psm": psm,
+                    "config": config,
+                    "image": variant_image,
+                    "word_boxes": words,
+                }
+
+    if best is None:
+        detail = "OCR processing failed" if not attempts else f"OCR processing failed ({'; '.join(attempts[:4])})"
+        raise HTTPException(status_code=400, detail=detail)
+
+    text = ""
+    try:
+        text = str(pytesseract.image_to_string(best["image"], config=best["config"]))
+    except Exception:
+        text = ""
+    text = text.strip() or _word_boxes_to_text(best["word_boxes"])
+
+    return {
+        "text": text,
+        "word_boxes": best["word_boxes"],
+        "variant": best["variant"],
+        "psm": best["psm"],
+        "image_width": int(best["image"].size[0]),
+        "image_height": int(best["image"].size[1]),
+    }
+
+
+async def _extract_structured_ocr(image_base64: str, use_ai_layout: bool = True) -> Dict[str, Any]:
+    ocr = await run_in_threadpool(_run_tesseract_ocr, image_base64)
+    text = str(ocr.get("text") or "").strip()
+    word_boxes = ocr.get("word_boxes") if isinstance(ocr.get("word_boxes"), list) else []
+
+    text_rows = _normalize_table_rows(parse_tabular_text(text))
+    box_rows = _table_from_word_boxes(word_boxes, int(ocr.get("image_width") or 0))
+    ai_rows: List[List[Any]] = []
+
+    if use_ai_layout:
+        seed_rows = box_rows if box_rows else text_rows
+        ai_rows = await _ai_refine_ocr_rows(text, word_boxes, seed_rows)
+
+    source, best_rows = _choose_best_rows(
+        [
+            ("ai", ai_rows),
+            ("geometry", box_rows),
+            ("text", text_rows),
+        ]
+    )
+
+    if not best_rows and text:
+        source = "lines"
+        best_rows = _normalize_table_rows([[line] for line in text.splitlines() if line.strip()])
+
+    return {
+        "text": text,
+        "rows": best_rows,
+        "row_count": len(best_rows),
+        "column_count": max((len(row) for row in best_rows), default=0),
+        "line_count": len([line for line in text.splitlines() if line.strip()]),
+        "layout_source": source,
+        "ocr_engine": "pytesseract",
+        "ocr_variant": ocr.get("variant"),
+        "ocr_psm": ocr.get("psm"),
+        "word_count": len(word_boxes),
+    }
 
 
 @app.get("/health")
@@ -704,18 +1208,21 @@ def paste_text(request: PasteTextRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/ocr-text")
-def ocr_text(request: OcrRequest) -> Dict[str, Any]:
-    text = _ocr_image_to_text(request.image_base64)
-    return {
-        "text": text,
-        "line_count": len([line for line in text.splitlines() if line.strip()]),
-    }
+async def ocr_text(request: OcrRequest) -> Dict[str, Any]:
+    return await _extract_structured_ocr(
+        image_base64=request.image_base64,
+        use_ai_layout=bool(request.use_ai_layout),
+    )
 
 
 @app.post("/api/paste-ocr")
-def paste_ocr(request: OcrPasteRequest) -> Dict[str, Any]:
-    text = _ocr_image_to_text(request.image_base64)
-    rows = parse_tabular_text(text)
+async def paste_ocr(request: OcrPasteRequest) -> Dict[str, Any]:
+    ocr_payload = await _extract_structured_ocr(
+        image_base64=request.image_base64,
+        use_ai_layout=bool(request.use_ai_layout),
+    )
+    text = str(ocr_payload.get("text") or "")
+    rows = ocr_payload.get("rows") if isinstance(ocr_payload.get("rows"), list) else []
     if not rows:
         raise HTTPException(status_code=400, detail="OCR succeeded but no tabular data was detected")
 
@@ -730,6 +1237,9 @@ def paste_ocr(request: OcrPasteRequest) -> Dict[str, Any]:
         "ok": True,
         "message": result.get("message", "Data written"),
         "ocr_text": text,
+        "layout_source": ocr_payload.get("layout_source"),
+        "ocr_variant": ocr_payload.get("ocr_variant"),
+        "ocr_psm": ocr_payload.get("ocr_psm"),
         "rows_written": len(rows),
         "columns_written": max((len(r) for r in rows), default=0),
     }
