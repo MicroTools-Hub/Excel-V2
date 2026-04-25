@@ -19,6 +19,9 @@
   <AppDomains>
     <AppDomain>https://excel-v2.onrender.com</AppDomain>
     <AppDomain>https://localhost:3000</AppDomain>
+    <AppDomain>https://fonts.googleapis.com</AppDomain>
+    <AppDomain>https://fonts.gstatic.com</AppDomain>
+    <AppDomain>https://cdn.jsdelivr.net</AppDomain>
   </AppDomains>
 
   <Hosts>

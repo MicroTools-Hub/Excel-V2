@@ -2,6 +2,7 @@ const state = {
   messages: [],
   parsedRows: [],
   isExcelHost: false,
+  isBusy: false,
 };
 
 const ui = {
@@ -24,6 +25,7 @@ const ui = {
   ocrStatus: document.getElementById("ocrStatus"),
   actionStatus: document.getElementById("actionStatus"),
   previewGrid: document.getElementById("previewGrid"),
+  quickButtons: Array.from(document.querySelectorAll("[data-prompt]")),
 };
 
 function updateStatus(element, message, isError = false) {
@@ -37,6 +39,47 @@ function appendMessage(role, content) {
   item.textContent = content;
   ui.messages.appendChild(item);
   ui.messages.scrollTop = ui.messages.scrollHeight;
+}
+
+function setBusy(isBusy, statusMessage = "") {
+  state.isBusy = Boolean(isBusy);
+
+  ui.chatInput.disabled = state.isBusy;
+  ui.sendBtn.disabled = state.isBusy;
+  ui.clearChatBtn.disabled = state.isBusy;
+  ui.filepathInput.disabled = state.isBusy;
+  ui.sheetInput.disabled = state.isBusy;
+  ui.startCellInput.disabled = state.isBusy;
+  ui.pasteInput.disabled = state.isBusy;
+  ui.previewBtn.disabled = state.isBusy;
+  ui.pasteExcelBtn.disabled = state.isBusy;
+  ui.pasteServerBtn.disabled = state.isBusy;
+  ui.ocrBtn.disabled = state.isBusy;
+  ui.ocrToExcelBtn.disabled = state.isBusy;
+  ui.ocrToServerBtn.disabled = state.isBusy;
+
+  ui.quickButtons.forEach((button) => {
+    button.disabled = state.isBusy;
+  });
+
+  ui.sendBtn.textContent = state.isBusy ? "Working..." : "Send";
+
+  if (statusMessage) {
+    updateStatus(ui.actionStatus, statusMessage, false);
+  }
+}
+
+async function runBusyTask(statusMessage, task) {
+  if (state.isBusy) {
+    return null;
+  }
+
+  setBusy(true, statusMessage);
+  try {
+    return await task();
+  } finally {
+    setBusy(false);
+  }
 }
 
 function normalizeRows(rows) {
@@ -166,13 +209,26 @@ function toRectangularData(rawData) {
   });
 }
 
+function stripSheetQualifier(address) {
+  const raw = String(address || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const withoutSheet = raw.includes("!") ? raw.split("!").pop() : raw;
+  return String(withoutSheet || "").replace(/\$/g, "").trim();
+}
+
 function resolveRangeAddress(args) {
   if (typeof args.range === "string" && args.range.trim()) {
-    return args.range.trim();
+    return stripSheetQualifier(args.range);
   }
 
-  const start = typeof args.start_cell === "string" && args.start_cell.trim() ? args.start_cell.trim() : "A1";
-  const end = typeof args.end_cell === "string" && args.end_cell.trim() ? args.end_cell.trim() : "";
+  const start = typeof args.start_cell === "string" && args.start_cell.trim()
+    ? stripSheetQualifier(args.start_cell)
+    : "A1";
+  const end = typeof args.end_cell === "string" && args.end_cell.trim()
+    ? stripSheetQualifier(args.end_cell)
+    : "";
   return end ? `${start}:${end}` : start;
 }
 
@@ -181,8 +237,7 @@ function getRangeStartCell(rangeAddress) {
     return "A1";
   }
   const rawStart = rangeAddress.split(":")[0].trim();
-  const noSheet = rawStart.includes("!") ? rawStart.split("!").pop() : rawStart;
-  const normalized = (noSheet || "").replace(/\$/g, "").trim();
+  const normalized = stripSheetQualifier(rawStart);
   return normalized || "A1";
 }
 
@@ -259,6 +314,299 @@ function makeSheetName(rawName, fallbackPrefix = "Smart") {
     .trim()
     .slice(0, 31);
   return cleaned || `${fallbackPrefix}_${Date.now()}`.slice(0, 31);
+}
+
+function normalizeHeaderText(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ");
+}
+
+function promptIncludesAll(prompt, tokens) {
+  return tokens.every((token) => prompt.includes(token));
+}
+
+function isNonEmptyCell(value) {
+  return value !== null && value !== undefined && String(value).trim() !== "";
+}
+
+function matchesStudentSampleIntent(prompt) {
+  return (
+    prompt.includes("student")
+    && (prompt.includes("sample data") || prompt.includes("dataset") || prompt.includes("table"))
+    && (prompt.includes("roll") || prompt.includes("rollnumber") || prompt.includes("roll number"))
+    && prompt.includes("mark")
+  );
+}
+
+function matchesStudentFormulaIntent(prompt) {
+  return (
+    promptIncludesAll(prompt, ["useful", "formula"])
+    || promptIncludesAll(prompt, ["add", "formula"])
+    || promptIncludesAll(prompt, ["total", "average"])
+    || promptIncludesAll(prompt, ["percentage", "grade"])
+  );
+}
+
+function getSampleStudentRows() {
+  return [
+    ["Name", "Roll Number", "Math", "Science", "English", "History", "Total", "Average", "Percentage", "Grade"],
+    ["John Smith", 101, 85, 92, 78, 88, "", "", "", ""],
+    ["Emma Johnson", 102, 92, 88, 95, 90, "", "", "", ""],
+    ["Michael Brown", 103, 78, 85, 82, 79, "", "", "", ""],
+    ["Sarah Davis", 104, 95, 90, 88, 92, "", "", "", ""],
+    ["David Wilson", 105, 82, 79, 85, 80, "", "", "", ""],
+    ["Lisa Miller", 106, 90, 95, 92, 88, "", "", "", ""],
+    ["Robert Taylor", 107, 75, 82, 78, 85, "", "", "", ""],
+    ["Jennifer Lee", 108, 88, 85, 90, 87, "", "", "", ""],
+    ["William Clark", 109, 92, 88, 85, 91, "", "", "", ""],
+    ["Amanda White", 110, 85, 90, 92, 89, "", "", "", ""],
+  ];
+}
+
+function findHeaderIndex(headers, aliases) {
+  const normalizedAliases = aliases.map((alias) => normalizeHeaderText(alias));
+  return headers.findIndex((header) => normalizedAliases.includes(normalizeHeaderText(header)));
+}
+
+function findStudentMarksLayout(values) {
+  const rows = toRectangularData(values);
+  if (rows.length < 2) {
+    return null;
+  }
+
+  const headers = rows[0].map((value) => String(value ?? "").trim());
+  const nameIndex = findHeaderIndex(headers, ["name", "student name"]);
+  const rollIndex = findHeaderIndex(headers, ["roll number", "rollnumber", "roll no", "roll"]);
+  if (nameIndex < 0 || rollIndex < 0) {
+    return null;
+  }
+
+  const metricNames = new Set(["total", "average", "avg", "percentage", "percent", "grade"]);
+  const subjectIndices = headers
+    .map((header, index) => ({ header, index }))
+    .filter(({ header, index }) => {
+      const normalized = normalizeHeaderText(header);
+      if (!normalized || metricNames.has(normalized)) {
+        return false;
+      }
+      return index !== nameIndex && index !== rollIndex;
+    })
+    .map(({ index }) => index);
+
+  if (subjectIndices.length < 2) {
+    return null;
+  }
+
+  let dataRowStart = 1;
+  let dataRowEnd = 0;
+  for (let rowIndex = 1; rowIndex < rows.length; rowIndex += 1) {
+    const row = rows[rowIndex];
+    const hasName = isNonEmptyCell(row[nameIndex]);
+    const hasRoll = isNonEmptyCell(row[rollIndex]);
+    const hasSubjectData = subjectIndices.some((index) => isNonEmptyCell(row[index]));
+
+    if (hasName || hasRoll || hasSubjectData) {
+      dataRowEnd = rowIndex;
+      continue;
+    }
+
+    if (dataRowEnd >= dataRowStart) {
+      break;
+    }
+  }
+
+  if (dataRowEnd < dataRowStart) {
+    return null;
+  }
+
+  return {
+    headers,
+    nameIndex,
+    rollIndex,
+    subjectIndices,
+    dataRowStart,
+    dataRowEnd,
+    summaryLabelRow: rows.findIndex((row, index) => index > dataRowEnd && normalizeHeaderText(row[0]) === "summary statistics"),
+    metrics: {
+      total: findHeaderIndex(headers, ["total"]),
+      average: findHeaderIndex(headers, ["average", "avg"]),
+      percentage: findHeaderIndex(headers, ["percentage", "percent"]),
+      grade: findHeaderIndex(headers, ["grade"]),
+    },
+  };
+}
+
+async function createSampleStudentDataset() {
+  const rows = getSampleStudentRows();
+
+  return Excel.run(async (context) => {
+    const sheet = getActiveWorksheet(context);
+    const usedRange = sheet.getUsedRangeOrNullObject(true);
+    usedRange.load("isNullObject");
+    await context.sync();
+
+    if (!usedRange.isNullObject) {
+      usedRange.clear();
+    }
+
+    const target = sheet.getRange("A1").getResizedRange(rows.length - 1, rows[0].length - 1);
+    target.values = rows;
+
+    const headerRange = sheet.getRange(`A1:${columnNumberToName(rows[0].length)}1`);
+    headerRange.format.font.bold = true;
+    headerRange.format.fill.color = "#1F3330";
+    headerRange.format.font.color = "#F3F7F5";
+
+    sheet.getRange(`B2:B${rows.length}`).numberFormat = Array.from({ length: rows.length - 1 }, () => ["0"]);
+    target.format.autofitColumns();
+    target.format.autofitRows();
+    await context.sync();
+
+    return {
+      reply: "Created a clean 10-row student marks table with Name, Roll Number, four subjects, and placeholder columns for Total, Average, Percentage, and Grade.",
+      status: "Sample student table written to the active sheet.",
+    };
+  });
+}
+
+async function addStudentDerivedFormulas() {
+  return Excel.run(async (context) => {
+    const sheet = getActiveWorksheet(context);
+    const usedRange = sheet.getUsedRangeOrNullObject(true);
+    usedRange.load("isNullObject,values,rowCount,columnCount");
+    await context.sync();
+
+    if (usedRange.isNullObject) {
+      return null;
+    }
+
+    const layout = findStudentMarksLayout(usedRange.values);
+    if (!layout) {
+      return null;
+    }
+
+    const headerRow = 1;
+    const firstDataRow = layout.dataRowStart + 1;
+    const lastDataRow = layout.dataRowEnd + 1;
+    const subjectStartCol = columnNumberToName(layout.subjectIndices[0] + 1);
+    const subjectEndCol = columnNumberToName(layout.subjectIndices[layout.subjectIndices.length - 1] + 1);
+
+    const metricIndexes = { ...layout.metrics };
+    let nextColumnIndex = Math.max(...layout.subjectIndices, layout.rollIndex, layout.nameIndex) + 1;
+    ["total", "average", "percentage", "grade"].forEach((metricName) => {
+      if (metricIndexes[metricName] < 0) {
+        metricIndexes[metricName] = nextColumnIndex;
+        nextColumnIndex += 1;
+      }
+    });
+
+    const metricHeaders = {
+      total: "Total",
+      average: "Average",
+      percentage: "Percentage",
+      grade: "Grade",
+    };
+    Object.entries(metricIndexes).forEach(([metricName, columnIndex]) => {
+      sheet.getCell(headerRow - 1, columnIndex).values = [[metricHeaders[metricName]]];
+    });
+
+    const totalCol = columnNumberToName(metricIndexes.total + 1);
+    const averageCol = columnNumberToName(metricIndexes.average + 1);
+    const percentageCol = columnNumberToName(metricIndexes.percentage + 1);
+    const gradeCol = columnNumberToName(metricIndexes.grade + 1);
+    const subjectCount = layout.subjectIndices.length;
+    const formulaRowCount = lastDataRow - firstDataRow + 1;
+
+    const totalFormulas = [];
+    const averageFormulas = [];
+    const percentageFormulas = [];
+    const gradeFormulas = [];
+
+    for (let excelRow = firstDataRow; excelRow <= lastDataRow; excelRow += 1) {
+      totalFormulas.push([`=SUM(${subjectStartCol}${excelRow}:${subjectEndCol}${excelRow})`]);
+      averageFormulas.push([`=ROUND(AVERAGE(${subjectStartCol}${excelRow}:${subjectEndCol}${excelRow}),2)`]);
+      percentageFormulas.push([`=ROUND(${totalCol}${excelRow}/(${subjectCount}*100)*100,2)`]);
+      gradeFormulas.push([`=IF(${percentageCol}${excelRow}>=90,"A+",IF(${percentageCol}${excelRow}>=80,"A",IF(${percentageCol}${excelRow}>=70,"B",IF(${percentageCol}${excelRow}>=60,"C",IF(${percentageCol}${excelRow}>=50,"D","F")))))`]);
+    }
+
+    sheet.getRange(`${totalCol}${firstDataRow}:${totalCol}${lastDataRow}`).formulas = totalFormulas;
+    sheet.getRange(`${averageCol}${firstDataRow}:${averageCol}${lastDataRow}`).formulas = averageFormulas;
+    sheet.getRange(`${percentageCol}${firstDataRow}:${percentageCol}${lastDataRow}`).formulas = percentageFormulas;
+    sheet.getRange(`${gradeCol}${firstDataRow}:${gradeCol}${lastDataRow}`).formulas = gradeFormulas;
+    sheet.getRange(`${percentageCol}${firstDataRow}:${percentageCol}${lastDataRow}`).numberFormat = Array.from(
+      { length: formulaRowCount },
+      () => ["0.00"],
+    );
+
+    const headerEndCol = columnNumberToName(Math.max(...Object.values(metricIndexes)) + 1);
+    const headerRange = sheet.getRange(`A1:${headerEndCol}1`);
+    headerRange.format.font.bold = true;
+    headerRange.format.fill.color = "#1F3330";
+    headerRange.format.font.color = "#F3F7F5";
+
+    let cleanedSummary = false;
+    if (layout.summaryLabelRow >= 0) {
+      const summaryStartRow = layout.summaryLabelRow + 1;
+      const summaryEndRow = Math.min(summaryStartRow + 8, usedRange.rowCount);
+      sheet.getRange(`A${summaryStartRow}:${headerEndCol}${summaryEndRow}`).clear();
+      cleanedSummary = true;
+    }
+
+    sheet.getRange(`A1:${headerEndCol}${lastDataRow}`).format.autofitColumns();
+    sheet.getRange(`A1:${headerEndCol}${lastDataRow}`).format.autofitRows();
+    await context.sync();
+
+    return {
+      reply: cleanedSummary
+        ? `Filled Total, Average, Percentage, and Grade for each student, and removed the earlier summary block that was cluttering the sheet.`
+        : `Filled Total, Average, Percentage, and Grade for each student in the next logical columns.`,
+      status: `Added formulas to ${totalCol}:${gradeCol} for rows ${firstDataRow}:${lastDataRow}.`,
+    };
+  });
+}
+
+async function tryHandleLocalCopilotIntent(prompt) {
+  if (!state.isExcelHost) {
+    return null;
+  }
+
+  const normalizedPrompt = String(prompt || "").trim().toLowerCase();
+  const shouldCreateStudentData = matchesStudentSampleIntent(normalizedPrompt);
+  const shouldAddStudentFormulas = matchesStudentFormulaIntent(normalizedPrompt);
+
+  if (!shouldCreateStudentData && !shouldAddStudentFormulas) {
+    return null;
+  }
+
+  const replies = [];
+  let lastStatus = "Applied changes to active workbook.";
+
+  if (shouldCreateStudentData) {
+    const datasetResult = await createSampleStudentDataset();
+    if (datasetResult) {
+      replies.push(datasetResult.reply);
+      lastStatus = datasetResult.status || lastStatus;
+    }
+  }
+
+  if (shouldAddStudentFormulas) {
+    const formulaResult = await addStudentDerivedFormulas();
+    if (formulaResult) {
+      replies.push(formulaResult.reply);
+      lastStatus = formulaResult.status || lastStatus;
+    }
+  }
+
+  if (!replies.length) {
+    return null;
+  }
+
+  return {
+    reply: replies.join("\n\n"),
+    status: lastStatus,
+  };
 }
 
 function getColumnIndex(headers, fieldName) {
@@ -711,94 +1059,103 @@ async function executeOperationsInExcel(operations) {
 
 async function sendChat() {
   const prompt = ui.chatInput.value.trim();
-  if (!prompt) {
+  if (!prompt || state.isBusy) {
     return;
   }
 
-  appendMessage("user", prompt);
-  state.messages.push({ role: "user", content: prompt });
-  ui.chatInput.value = "";
-  updateStatus(ui.actionStatus, "Thinking...");
+  return runBusyTask("Thinking...", async () => {
+    appendMessage("user", prompt);
+    state.messages.push({ role: "user", content: prompt });
+    ui.chatInput.value = "";
 
-  const config = getWorkbookConfig();
-  let sheetSnapshot = null;
-
-  if (state.isExcelHost) {
     try {
-      updateStatus(ui.actionStatus, "Reading full sheet context...");
-      sheetSnapshot = await collectExcelSheetSnapshot();
-    } catch (error) {
-      appendMessage("system", `Warning: Could not read full sheet context: ${error.message}`);
-    }
-  }
-
-  const effectiveSheetName =
-    sheetSnapshot && sheetSnapshot.sheet_name
-      ? String(sheetSnapshot.sheet_name)
-      : (config.sheet_name || null);
-
-  const effectiveStartCell =
-    sheetSnapshot && sheetSnapshot.selection_start_cell
-      ? String(sheetSnapshot.selection_start_cell)
-      : config.start_cell;
-
-  const payload = {
-    messages: state.messages,
-    filepath: config.filepath || null,
-    sheet_name: effectiveSheetName,
-    start_cell: effectiveStartCell,
-    sheet_snapshot: sheetSnapshot,
-    auto_execute: !state.isExcelHost,
-  };
-
-  try {
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      let errorText = "";
-      try {
-        const payload = await response.json();
-        errorText = payload && payload.detail ? String(payload.detail) : JSON.stringify(payload);
-      } catch (_err) {
-        errorText = await response.text();
+      const localResult = await tryHandleLocalCopilotIntent(prompt);
+      if (localResult) {
+        appendMessage("assistant", localResult.reply);
+        state.messages.push({ role: "assistant", content: localResult.reply });
+        updateStatus(ui.actionStatus, localResult.status || "Applied changes to active workbook.");
+        return;
       }
-      throw new Error(errorText || `Chat request failed (${response.status})`);
-    }
 
-    const data = await response.json();
-    let executionSuffix = "";
-    if (Array.isArray(data.operations) && data.operations.length) {
+      const config = getWorkbookConfig();
+      let sheetSnapshot = null;
+
       if (state.isExcelHost) {
-        const localExecution = await executeOperationsInExcel(data.operations);
-        executionSuffix = `\n\nApplied ${localExecution.executed} operation(s) to active workbook.`;
-        if (localExecution.warnings.length) {
-          executionSuffix += `\n${localExecution.warnings.slice(0, 2).join(" ")}`;
+        try {
+          updateStatus(ui.actionStatus, "Reading full sheet context...");
+          sheetSnapshot = await collectExcelSheetSnapshot();
+        } catch (error) {
+          appendMessage("system", `Warning: Could not read full sheet context: ${error.message}`);
         }
-      } else if (Array.isArray(data.operation_results) && data.operation_results.length) {
-        executionSuffix = `\n\nExecuted ${data.operation_results.length} server operation(s).`;
       }
+
+      const effectiveSheetName =
+        sheetSnapshot && sheetSnapshot.sheet_name
+          ? String(sheetSnapshot.sheet_name)
+          : (config.sheet_name || null);
+
+      const effectiveStartCell =
+        sheetSnapshot && sheetSnapshot.selection_start_cell
+          ? String(sheetSnapshot.selection_start_cell)
+          : config.start_cell;
+
+      const payload = {
+        messages: state.messages,
+        filepath: config.filepath || null,
+        sheet_name: effectiveSheetName,
+        start_cell: effectiveStartCell,
+        sheet_snapshot: sheetSnapshot,
+        auto_execute: !state.isExcelHost,
+      };
+
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        let errorText = "";
+        try {
+          const errorPayload = await response.json();
+          errorText = errorPayload && errorPayload.detail ? String(errorPayload.detail) : JSON.stringify(errorPayload);
+        } catch (_err) {
+          errorText = await response.text();
+        }
+        throw new Error(errorText || `Chat request failed (${response.status})`);
+      }
+
+      const data = await response.json();
+      let executionSuffix = "";
+      if (Array.isArray(data.operations) && data.operations.length) {
+        if (state.isExcelHost) {
+          const localExecution = await executeOperationsInExcel(data.operations);
+          executionSuffix = `\n\nApplied ${localExecution.executed} operation(s) to active workbook.`;
+          if (localExecution.warnings.length) {
+            executionSuffix += `\n${localExecution.warnings.slice(0, 2).join(" ")}`;
+          }
+        } else if (Array.isArray(data.operation_results) && data.operation_results.length) {
+          executionSuffix = `\n\nExecuted ${data.operation_results.length} server operation(s).`;
+        }
+      }
+
+      if (Array.isArray(data.operation_validation_warnings) && data.operation_validation_warnings.length) {
+        executionSuffix += `\nValidation warnings: ${data.operation_validation_warnings.slice(0, 2).join(" ")}`;
+      }
+
+      if (data.sheet_context_mode === "compact-fallback") {
+        executionSuffix += "\nSheet context fallback: full-sheet snapshot timed out, compact context used.";
+      }
+
+      appendMessage("assistant", `${data.reply || "No response"}${executionSuffix}`);
+      state.messages.push({ role: "assistant", content: data.reply || "" });
+
+      updateStatus(ui.actionStatus, state.isExcelHost ? "Applied changes to active workbook." : `Model: ${data.model}`);
+    } catch (error) {
+      appendMessage("system", `Error: ${error.message}`);
+      updateStatus(ui.actionStatus, `Chat error: ${error.message}`, true);
     }
-
-    if (Array.isArray(data.operation_validation_warnings) && data.operation_validation_warnings.length) {
-      executionSuffix += `\nValidation warnings: ${data.operation_validation_warnings.slice(0, 2).join(" ")}`;
-    }
-
-    if (data.sheet_context_mode === "compact-fallback") {
-      executionSuffix += "\nSheet context fallback: full-sheet snapshot timed out, compact context used.";
-    }
-
-    appendMessage("assistant", `${data.reply || "No response"}${executionSuffix}`);
-    state.messages.push({ role: "assistant", content: data.reply || "" });
-
-    updateStatus(ui.actionStatus, state.isExcelHost ? "Applied changes to active workbook." : `Model: ${data.model}`);
-  } catch (error) {
-    appendMessage("system", `Error: ${error.message}`);
-    updateStatus(ui.actionStatus, `Chat error: ${error.message}`, true);
-  }
+  });
 }
 
 async function pasteToActiveSelection(rows) {
@@ -826,7 +1183,8 @@ async function pasteToServerWorkbook(rows) {
     throw new Error("Workbook file and sheet name are required for server paste");
   }
 
-  const text = ui.pasteInput.value;
+  const normalizedRows = Array.isArray(rows) && rows.length ? rows : parseTabularText(ui.pasteInput.value);
+  const text = rowsToTsv(normalizedRows) || ui.pasteInput.value;
   const response = await fetch("/api/paste-text", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -857,6 +1215,7 @@ function pickImageFile() {
       }
       resolve(file);
     };
+    ui.imageInput.value = "";
     ui.imageInput.addEventListener("change", handler, { once: true });
     ui.imageInput.click();
   });
@@ -884,6 +1243,137 @@ function rowsToTsv(rows) {
     .join("\n");
 }
 
+function normalizeOcrCellText(value) {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function median(numbers, fallback = 0) {
+  const values = numbers
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (!values.length) {
+    return fallback;
+  }
+  const middle = Math.floor(values.length / 2);
+  return values.length % 2 === 0 ? (values[middle - 1] + values[middle]) / 2 : values[middle];
+}
+
+function groupBrowserOcrWordsIntoRows(words) {
+  if (!Array.isArray(words) || !words.length) {
+    return [];
+  }
+
+  const sorted = words
+    .map((word) => {
+      const text = normalizeOcrCellText(word && word.text);
+      const bbox = word && typeof word === "object" ? word.bbox || {} : {};
+      const left = Number(bbox.x0);
+      const top = Number(bbox.y0);
+      const right = Number(bbox.x1);
+      const bottom = Number(bbox.y1);
+
+      if (!text || !Number.isFinite(left) || !Number.isFinite(top) || !Number.isFinite(right) || !Number.isFinite(bottom)) {
+        return null;
+      }
+
+      return {
+        text,
+        left,
+        top,
+        right,
+        bottom,
+        width: Math.max(1, right - left),
+        height: Math.max(1, bottom - top),
+        centerY: top + ((bottom - top) / 2),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => (a.top - b.top) || (a.left - b.left));
+
+  if (!sorted.length) {
+    return [];
+  }
+
+  const tolerance = Math.max(10, median(sorted.map((word) => word.height), 16) * 0.7);
+  const rows = [];
+
+  sorted.forEach((word) => {
+    const lastRow = rows[rows.length - 1];
+    if (!lastRow || Math.abs(lastRow.centerY - word.centerY) > tolerance) {
+      rows.push({
+        centerY: word.centerY,
+        words: [word],
+      });
+      return;
+    }
+
+    lastRow.words.push(word);
+    lastRow.centerY = (lastRow.centerY + word.centerY) / 2;
+  });
+
+  return rows.map((row) => row.words.sort((a, b) => a.left - b.left));
+}
+
+function buildRowsFromBrowserOcr(words) {
+  const groupedRows = groupBrowserOcrWordsIntoRows(words);
+  if (!groupedRows.length) {
+    return [];
+  }
+
+  const gapThreshold = Math.max(18, median(
+    groupedRows.flatMap((row) => row.map((word) => word.width)),
+    28,
+  ) * 1.35);
+
+  const rows = groupedRows.map((rowWords) => {
+    const cells = [];
+    let currentCell = null;
+
+    rowWords.forEach((word) => {
+      if (!currentCell) {
+        currentCell = { text: word.text, right: word.right };
+        return;
+      }
+
+      const gap = word.left - currentCell.right;
+      if (gap > gapThreshold) {
+        cells.push(currentCell.text);
+        currentCell = { text: word.text, right: word.right };
+        return;
+      }
+
+      currentCell.text = `${currentCell.text} ${word.text}`.trim();
+      currentCell.right = word.right;
+    });
+
+    if (currentCell) {
+      cells.push(currentCell.text);
+    }
+
+    return cells;
+  });
+
+  return normalizeRows(rows);
+}
+
+function rowsFromOcrPayload(payload) {
+  const candidateRows = Array.isArray(payload && payload.rows) ? payload.rows : [];
+  if (candidateRows.length) {
+    return normalizeRows(
+      candidateRows.map((row) => (
+        Array.isArray(row)
+          ? row.map((cell) => String(cell ?? ""))
+          : [String(row ?? "")]
+      ))
+    );
+  }
+
+  return parseTabularText(String((payload && payload.text) || ""));
+}
+
 async function requestServerOcr(imageBase64) {
   const response = await fetch("/api/ocr-text", {
     method: "POST",
@@ -900,6 +1390,56 @@ async function requestServerOcr(imageBase64) {
   }
 
   return response.json();
+}
+
+async function requestBrowserOcr(imageBase64) {
+  if (!window.Tesseract || typeof window.Tesseract.recognize !== "function") {
+    throw new Error("Browser OCR fallback is unavailable because Tesseract.js did not load.");
+  }
+
+  const result = await window.Tesseract.recognize(imageBase64, "eng", {
+    logger(message) {
+      if (!message || !message.status) {
+        return;
+      }
+      const progress = Number.isFinite(message.progress)
+        ? ` ${Math.round(message.progress * 100)}%`
+        : "";
+      updateStatus(ui.ocrStatus, `Browser OCR: ${message.status}${progress}`);
+    },
+  });
+
+  const text = String((result && result.data && result.data.text) || "").trim();
+  const words = Array.isArray(result && result.data && result.data.words) ? result.data.words : [];
+  const geometryRows = buildRowsFromBrowserOcr(words);
+  const textRows = parseTabularText(text);
+  const rows = geometryRows.length ? geometryRows : textRows;
+
+  return {
+    text,
+    rows,
+    line_count: text ? text.split(/\r?\n/).filter((line) => line.trim()).length : 0,
+    layout_source: geometryRows.length ? "browser-geometry" : "browser-text",
+    ocr_engine: "tesseract.js",
+    word_count: words.length,
+  };
+}
+
+async function requestStructuredOcr(imageBase64) {
+  try {
+    const serverPayload = await requestServerOcr(imageBase64);
+    if (rowsFromOcrPayload(serverPayload).length) {
+      return serverPayload;
+    }
+
+    const fallbackPayload = await requestBrowserOcr(imageBase64);
+    fallbackPayload.fallback_reason = "Server OCR returned no usable table rows.";
+    return fallbackPayload;
+  } catch (error) {
+    const fallbackPayload = await requestBrowserOcr(imageBase64);
+    fallbackPayload.fallback_reason = error.message;
+    return fallbackPayload;
+  }
 }
 
 async function pasteOcrImageToServerWorkbook(imageBase64) {
@@ -933,26 +1473,26 @@ async function runOcrFlow() {
   updateStatus(ui.ocrStatus, "Preparing image for OCR...");
   const imageBase64 = await fileToDataUrl(file);
 
-  updateStatus(ui.ocrStatus, "Analyzing image layout with AI OCR...");
-  const payload = await requestServerOcr(imageBase64);
+  updateStatus(ui.ocrStatus, "Analyzing image layout...");
+  const payload = await requestStructuredOcr(imageBase64);
+  const rows = rowsFromOcrPayload(payload);
 
-  const serverRows = Array.isArray(payload.rows) ? payload.rows : [];
-  const rows = serverRows.length
-    ? normalizeRows(
-      serverRows.map((row) =>
-        (Array.isArray(row) ? row.map((cell) => String(cell ?? "")) : [String(row ?? "")])
-      )
-    )
-    : parseTabularText(String(payload.text || ""));
+  if (!rows.length) {
+    throw new Error("OCR finished, but no table-like data could be detected from the image.");
+  }
 
   state.parsedRows = rows;
   ui.pasteInput.value = rows.length ? rowsToTsv(rows) : String(payload.text || "");
   renderPreview(rows);
 
   const source = payload.layout_source ? String(payload.layout_source) : "text";
+  const engine = payload.ocr_engine ? String(payload.ocr_engine) : "ocr";
   const cols = rows.length ? rows[0].length : 0;
   const lines = Number.isFinite(payload.line_count) ? Number(payload.line_count) : 0;
-  updateStatus(ui.ocrStatus, `OCR complete (${source}). ${rows.length} rows x ${cols} cols from ${lines} lines.`);
+  const fallbackNote = payload.fallback_reason
+    ? ` Server OCR failed, so browser OCR was used instead.`
+    : "";
+  updateStatus(ui.ocrStatus, `OCR complete (${engine}, ${source}). ${rows.length} rows x ${cols} cols from ${lines} lines.${fallbackNote}`);
 
   return {
     rows,
@@ -982,68 +1522,81 @@ function bindEvents() {
   });
 
   ui.clearChatBtn.addEventListener("click", () => {
+    if (state.isBusy) {
+      return;
+    }
     state.messages = [];
     ui.messages.innerHTML = "";
     appendMessage("system", "Conversation cleared.");
   });
 
   ui.previewBtn.addEventListener("click", () => {
+    if (state.isBusy) {
+      return;
+    }
     const rows = parseTabularText(ui.pasteInput.value);
     state.parsedRows = rows;
     renderPreview(rows);
   });
 
   ui.pasteExcelBtn.addEventListener("click", async () => {
-    try {
-      const rows = state.parsedRows.length ? state.parsedRows : parseTabularText(ui.pasteInput.value);
-      state.parsedRows = rows;
-      await pasteToActiveSelection(rows);
-      updateStatus(ui.actionStatus, "Pasted to active Excel selection.");
-    } catch (error) {
-      updateStatus(ui.actionStatus, error.message, true);
-    }
+    await runBusyTask("Pasting parsed rows into Excel...", async () => {
+      try {
+        const rows = state.parsedRows.length ? state.parsedRows : parseTabularText(ui.pasteInput.value);
+        state.parsedRows = rows;
+        await pasteToActiveSelection(rows);
+        updateStatus(ui.actionStatus, "Pasted to active Excel selection.");
+      } catch (error) {
+        updateStatus(ui.actionStatus, error.message, true);
+      }
+    });
   });
 
   ui.pasteServerBtn.addEventListener("click", async () => {
-    try {
-      const rows = state.parsedRows.length ? state.parsedRows : parseTabularText(ui.pasteInput.value);
-      state.parsedRows = rows;
-      const payload = await pasteToServerWorkbook(rows);
-      updateStatus(ui.actionStatus, payload.message || "Data pasted to server workbook.");
-    } catch (error) {
-      updateStatus(ui.actionStatus, error.message, true);
-    }
+    await runBusyTask("Pasting parsed rows into the server workbook...", async () => {
+      try {
+        const rows = state.parsedRows.length ? state.parsedRows : parseTabularText(ui.pasteInput.value);
+        state.parsedRows = rows;
+        const payload = await pasteToServerWorkbook(rows);
+        updateStatus(ui.actionStatus, payload.message || "Data pasted to server workbook.");
+      } catch (error) {
+        updateStatus(ui.actionStatus, error.message, true);
+      }
+    });
   });
 
   ui.ocrBtn.addEventListener("click", async () => {
-    try {
-      await runOcrFlow();
-    } catch (error) {
-      updateStatus(ui.ocrStatus, error.message, true);
-    }
+    await runBusyTask("Running OCR on the selected image...", async () => {
+      try {
+        await runOcrFlow();
+      } catch (error) {
+        updateStatus(ui.ocrStatus, error.message, true);
+      }
+    });
   });
 
   ui.ocrToExcelBtn.addEventListener("click", async () => {
-    try {
-      const ocrResult = await runOcrFlow();
-      await pasteToActiveSelection(ocrResult.rows);
-      updateStatus(ui.actionStatus, "OCR table pasted to active Excel selection.");
-    } catch (error) {
-      updateStatus(ui.actionStatus, error.message, true);
-    }
+    await runBusyTask("Extracting the image and pasting it into Excel...", async () => {
+      try {
+        const ocrResult = await runOcrFlow();
+        await pasteToActiveSelection(ocrResult.rows);
+        updateStatus(ui.actionStatus, "OCR table pasted to active Excel selection.");
+      } catch (error) {
+        updateStatus(ui.actionStatus, error.message, true);
+      }
+    });
   });
 
   ui.ocrToServerBtn.addEventListener("click", async () => {
-    try {
-      const ocrResult = await runOcrFlow();
-      const payload = await pasteOcrImageToServerWorkbook(ocrResult.imageBase64);
-      updateStatus(
-        ui.actionStatus,
-        payload.message || `OCR pasted ${payload.rows_written || 0} rows x ${payload.columns_written || 0} cols to server workbook.`
-      );
-    } catch (error) {
-      updateStatus(ui.actionStatus, error.message, true);
-    }
+    await runBusyTask("Extracting the image and writing it to the server workbook...", async () => {
+      try {
+        const ocrResult = await runOcrFlow();
+        const payload = await pasteToServerWorkbook(ocrResult.rows);
+        updateStatus(ui.actionStatus, payload.message || "OCR table pasted to server workbook.");
+      } catch (error) {
+        updateStatus(ui.actionStatus, error.message, true);
+      }
+    });
   });
 }
 

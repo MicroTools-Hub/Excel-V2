@@ -169,6 +169,15 @@ body {
   border-color: var(--brand);
 }
 
+.quick-btn:disabled,
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+  transform: none;
+  filter: none;
+  border-color: var(--line);
+}
+
 .composer {
   width: 100%;
   min-height: 94px;
@@ -219,6 +228,13 @@ textarea {
   font: inherit;
   background: #fff;
   margin-bottom: 8px;
+}
+
+input:disabled,
+textarea:disabled {
+  background: #eef1ea;
+  color: #6a6f74;
+  cursor: not-allowed;
 }
 
 .paste-area {

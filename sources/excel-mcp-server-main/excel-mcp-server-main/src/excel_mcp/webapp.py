@@ -237,13 +237,21 @@ def _compact_sheet_snapshot(snapshot: Dict[str, Any], max_rows: int = 120, max_c
 def _is_valid_cell_ref(value: Any) -> bool:
     if not isinstance(value, str):
         return False
-    return bool(_CELL_REF_RE.fullmatch(value.strip()))
+    token = value.strip()
+    if "!" in token:
+        token = token.rsplit("!", 1)[-1]
+    token = token.replace("$", "").strip()
+    return bool(_CELL_REF_RE.fullmatch(token))
 
 
 def _is_valid_range_ref(value: Any) -> bool:
     if not isinstance(value, str):
         return False
-    return bool(_RANGE_REF_RE.fullmatch(value.strip()))
+    token = value.strip()
+    if "!" in token:
+        token = token.rsplit("!", 1)[-1]
+    token = token.replace("$", "").replace(" ", "").strip()
+    return bool(_RANGE_REF_RE.fullmatch(token))
 
 
 def _merge_operation_defaults(args: Dict[str, Any], request: ChatRequest) -> Dict[str, Any]:
@@ -308,6 +316,9 @@ def _validate_operation_pass_one(name: str, args: Dict[str, Any]) -> List[str]:
 
 def _validate_operation_pass_two(name: str, args: Dict[str, Any], request: ChatRequest) -> List[str]:
     errors: List[str] = []
+
+    if not request.auto_execute and name == "create_workbook":
+        errors.append("create_workbook is unavailable in active-workbook mode")
 
     filepath = args.get("filepath")
     if request.auto_execute and name in {
@@ -727,6 +738,7 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
         "<excel_plan>{\"assistant_reply\":\"...\",\"operations\":[{\"name\":\"write_data\",\"args\":{...}}]}</excel_plan>. "
         ""
         "Before returning operations, internally verify each operation twice for required args and reference validity. "
+        "If auto_execute is false, the user is working in a live Excel workbook, so NEVER use create_workbook. "
         "If the user asks to modify or format data, include at least one actionable operation (for example format_range, write_data, clear_range, or apply_formula). "
         "When live sheet_snapshot context is present, avoid read_data/get_workbook_metadata unless strictly necessary. "
         ""
@@ -739,6 +751,8 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
         "- For native Excel tables: Use create_table with {data_range, table_name, table_style}. "
         "- For complex aggregations: Use create_pivot_table with {data_range, rows, values, columns, agg_func}. "
         "- Always write results to logical locations (next empty column for row calculations, below data for column totals) "
+        "- If the sheet already looks like a student marks table, add Total, Average, Percentage, and Grade in adjacent columns for each row and do not create a separate summary block unless explicitly requested. "
+        "- For prompts like 'add useful formulas based on the current table', prefer filling formula columns next to the current table rather than creating extra summary sections. "
         ""
         "For write_data, prefer args {start_cell, data, optional sheet_name}; use range only when explicitly requested. "
         "For clearing cells, prefer clear_range with args {range, optional sheet_name}. "
