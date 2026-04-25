@@ -14,9 +14,6 @@
     <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   </head>
   <body>
-    <div class="bg-orb bg-orb-a"></div>
-    <div class="bg-orb bg-orb-b"></div>
-
     <div class="app-shell">
       <header class="app-header">
         <div>
@@ -31,6 +28,12 @@
           <div id="messages" class="messages"></div>
 
           <div class="composer-wrap">
+            <div class="quick-actions" aria-label="Quick prompts">
+              <button class="quick-btn" type="button" data-prompt="Explain the active sheet and point out useful next steps.">Explain</button>
+              <button class="quick-btn" type="button" data-prompt="Format the active used range cleanly with bold headers, readable widths, and professional colors.">Format</button>
+              <button class="quick-btn" type="button" data-prompt="Add useful formulas based on the current table, placing results in the next logical empty cells.">Formulas</button>
+              <button class="quick-btn" type="button" data-prompt="Create a chart from the current used range in the best chart type for this data.">Chart</button>
+            </div>
             <textarea
               id="chatInput"
               class="composer"

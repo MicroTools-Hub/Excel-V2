@@ -186,6 +186,176 @@ function getRangeStartCell(rangeAddress) {
   return normalized || "A1";
 }
 
+function normalizeHexColor(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return "";
+  }
+  const trimmed = value.trim();
+  if (trimmed.startsWith("#")) {
+    return trimmed;
+  }
+  if (/^[0-9a-fA-F]{6}$/.test(trimmed)) {
+    return `#${trimmed}`;
+  }
+  return trimmed;
+}
+
+function splitCellAddress(cellAddress) {
+  const match = String(cellAddress || "A1").replace(/\$/g, "").match(/^([A-Za-z]+)(\d+)$/);
+  if (!match) {
+    return { column: "A", row: 1 };
+  }
+  return { column: match[1].toUpperCase(), row: Number.parseInt(match[2], 10) };
+}
+
+function columnNameToNumber(columnName) {
+  return String(columnName || "A")
+    .toUpperCase()
+    .split("")
+    .reduce((total, char) => total * 26 + (char.charCodeAt(0) - 64), 0);
+}
+
+function columnNumberToName(columnNumber) {
+  let value = Math.max(1, Number.parseInt(columnNumber, 10) || 1);
+  let name = "";
+  while (value > 0) {
+    const rem = (value - 1) % 26;
+    name = String.fromCharCode(65 + rem) + name;
+    value = Math.floor((value - 1) / 26);
+  }
+  return name;
+}
+
+function offsetCellAddress(cellAddress, rowOffset, columnOffset) {
+  const parsed = splitCellAddress(cellAddress);
+  const col = columnNameToNumber(parsed.column) + Number(columnOffset || 0);
+  const row = parsed.row + Number(rowOffset || 0);
+  return `${columnNumberToName(col)}${Math.max(1, row)}`;
+}
+
+function normalizeChartType(chartType) {
+  const key = String(chartType || "bar").trim().toLowerCase();
+  const map = {
+    area: "Area",
+    bar: "BarClustered",
+    column: "ColumnClustered",
+    line: "Line",
+    pie: "Pie",
+    scatter: "XYScatter",
+  };
+  return map[key] || map.bar;
+}
+
+function makeTableName(rawName) {
+  const cleaned = String(rawName || `SmartTable${Date.now()}`)
+    .replace(/[^A-Za-z0-9_]/g, "_")
+    .replace(/^[^A-Za-z_]+/, "");
+  return cleaned || `SmartTable${Date.now()}`;
+}
+
+function makeSheetName(rawName, fallbackPrefix = "Smart") {
+  const cleaned = String(rawName || `${fallbackPrefix}_${Date.now()}`)
+    .replace(/[\\/?*\[\]:]/g, " ")
+    .trim()
+    .slice(0, 31);
+  return cleaned || `${fallbackPrefix}_${Date.now()}`.slice(0, 31);
+}
+
+function getColumnIndex(headers, fieldName) {
+  const target = String(fieldName || "").trim().toLowerCase();
+  return headers.findIndex((header) => String(header || "").trim().toLowerCase() === target);
+}
+
+function aggregateValues(values, aggFunc) {
+  const numeric = values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value));
+  const mode = String(aggFunc || "sum").toLowerCase();
+  if (mode === "count") {
+    return values.filter((value) => value !== null && value !== undefined && String(value).trim() !== "").length;
+  }
+  if (!numeric.length) {
+    return 0;
+  }
+  if (mode === "average" || mode === "avg" || mode === "mean") {
+    return numeric.reduce((sum, value) => sum + value, 0) / numeric.length;
+  }
+  if (mode === "min") {
+    return Math.min(...numeric);
+  }
+  if (mode === "max") {
+    return Math.max(...numeric);
+  }
+  return numeric.reduce((sum, value) => sum + value, 0);
+}
+
+async function getOrCreateWorksheet(context, sheetName) {
+  const name = makeSheetName(sheetName);
+  const sheet = context.workbook.worksheets.getItemOrNullObject(name);
+  sheet.load("isNullObject");
+  await context.sync();
+  if (!sheet.isNullObject) {
+    return sheet;
+  }
+  return context.workbook.worksheets.add(name);
+}
+
+async function writePivotSummary(context, sourceSheet, args) {
+  const sourceRange = sourceSheet.getRange(args.data_range || args.range || "A1");
+  sourceRange.load("values");
+  await context.sync();
+
+  const sourceValues = toRectangularData(sourceRange.values);
+  if (sourceValues.length < 2) {
+    throw new Error("Pivot summary needs a header row and at least one data row.");
+  }
+
+  const headers = sourceValues[0].map((header) => String(header || "").trim());
+  const rowFields = args.rows || args.row_fields || [];
+  const valueFields = args.values || args.value_fields || [];
+  const aggFunc = args.agg_func || "sum";
+  const rowIndexes = rowFields.map((field) => getColumnIndex(headers, field));
+  const valueIndexes = valueFields.map((field) => getColumnIndex(headers, field));
+
+  if (rowIndexes.some((index) => index < 0) || valueIndexes.some((index) => index < 0)) {
+    throw new Error("Pivot summary field names must match source headers.");
+  }
+
+  const buckets = new Map();
+  sourceValues.slice(1).forEach((row) => {
+    const keyParts = rowIndexes.map((index) => row[index] ?? "");
+    const key = JSON.stringify(keyParts);
+    if (!buckets.has(key)) {
+      buckets.set(key, { keyParts, values: valueIndexes.map(() => []) });
+    }
+    const bucket = buckets.get(key);
+    valueIndexes.forEach((index, valueIndex) => {
+      bucket.values[valueIndex].push(row[index]);
+    });
+  });
+
+  const output = [
+    [
+      ...rowFields,
+      ...valueFields.map((field) => `${field} (${aggFunc})`),
+    ],
+  ];
+  [...buckets.values()].forEach((bucket) => {
+    output.push([
+      ...bucket.keyParts,
+      ...bucket.values.map((items) => aggregateValues(items, aggFunc)),
+    ]);
+  });
+
+  const outputSheet = await getOrCreateWorksheet(context, args.output_sheet_name || "Smart Summary");
+  const target = outputSheet.getRange(args.output_start_cell || "A1").getResizedRange(output.length - 1, output[0].length - 1);
+  target.values = output;
+  target.format.autofitColumns();
+  target.format.autofitRows();
+  target.getRow(0).format.font.bold = true;
+  return output.length - 1;
+}
+
 function getActiveWorksheet(context) {
   return context.workbook.worksheets.getActiveWorksheet();
 }
@@ -337,15 +507,37 @@ async function executeOperationsInExcel(operations) {
         if (typeof args.underline === "boolean") {
           range.format.font.underline = args.underline ? "Single" : "None";
         }
+        if (Number.isFinite(Number(args.font_size))) {
+          range.format.font.size = Number(args.font_size);
+        }
         if (typeof args.font_color === "string" && args.font_color.trim()) {
-          range.format.font.color = args.font_color.trim().replace(/^#/, "");
+          range.format.font.color = normalizeHexColor(args.font_color);
         }
         if (typeof args.bg_color === "string" && args.bg_color.trim()) {
-          range.format.fill.color = args.bg_color.trim().replace(/^#/, "");
+          range.format.fill.color = normalizeHexColor(args.bg_color);
+        }
+        if (typeof args.alignment === "string" && args.alignment.trim()) {
+          const alignment = args.alignment.trim().toLowerCase();
+          const map = {
+            center: "Center",
+            left: "Left",
+            right: "Right",
+            justify: "Justify",
+          };
+          range.format.horizontalAlignment = map[alignment] || args.alignment;
         }
         if (typeof args.wrap_text === "boolean") {
           range.format.wrapText = args.wrap_text;
         }
+        if (typeof args.number_format === "string" && args.number_format.trim()) {
+          range.load("rowCount,columnCount");
+          await context.sync();
+          range.numberFormat = Array.from({ length: range.rowCount }, () =>
+            Array.from({ length: range.columnCount }, () => args.number_format)
+          );
+        }
+        range.format.autofitColumns();
+        range.format.autofitRows();
         executed += 1;
         continue;
       }
@@ -395,6 +587,115 @@ async function executeOperationsInExcel(operations) {
           continue;
         }
         toDelete.delete();
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "insert_rows") {
+        const startRow = Math.max(1, Number.parseInt(args.start_row || 1, 10));
+        const count = Math.max(1, Number.parseInt(args.count || 1, 10));
+        sheet.getRangeByIndexes(startRow - 1, 0, count, 1).getEntireRow().insert(Excel.InsertShiftDirection.down);
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "insert_columns") {
+        const startCol = Math.max(1, Number.parseInt(args.start_col || 1, 10));
+        const count = Math.max(1, Number.parseInt(args.count || 1, 10));
+        sheet.getRangeByIndexes(0, startCol - 1, 1, count).getEntireColumn().insert(Excel.InsertShiftDirection.right);
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "delete_sheet_rows") {
+        const startRow = Math.max(1, Number.parseInt(args.start_row || 1, 10));
+        const count = Math.max(1, Number.parseInt(args.count || 1, 10));
+        sheet.getRangeByIndexes(startRow - 1, 0, count, 1).getEntireRow().delete(Excel.DeleteShiftDirection.up);
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "delete_sheet_columns") {
+        const startCol = Math.max(1, Number.parseInt(args.start_col || 1, 10));
+        const count = Math.max(1, Number.parseInt(args.count || 1, 10));
+        sheet.getRangeByIndexes(0, startCol - 1, 1, count).getEntireColumn().delete(Excel.DeleteShiftDirection.left);
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "merge_cells") {
+        sheet.getRange(resolveRangeAddress(args)).merge(false);
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "unmerge_cells") {
+        sheet.getRange(resolveRangeAddress(args)).unmerge();
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "copy_range") {
+        const sourceAddress = args.source_end ? `${args.source_start}:${args.source_end}` : args.source_start;
+        const source = sheet.getRange(sourceAddress);
+        const targetSheet = await resolveWorksheet(context, args.target_sheet || args.sheet_name);
+        const target = targetSheet.getRange(args.target_start || "A1");
+        target.copyFrom(source, Excel.RangeCopyType.all, false, false);
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "delete_range") {
+        const shift = String(args.shift_direction || "up").toLowerCase() === "left"
+          ? Excel.DeleteShiftDirection.left
+          : Excel.DeleteShiftDirection.up;
+        sheet.getRange(resolveRangeAddress(args)).delete(shift);
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "create_table") {
+        const rangeAddress = args.data_range || args.range || resolveRangeAddress(args);
+        const table = context.workbook.tables.add(sheet.getRange(rangeAddress), true);
+        table.name = makeTableName(args.table_name);
+        table.style = args.table_style || "TableStyleMedium9";
+        sheet.getRange(rangeAddress).format.autofitColumns();
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "create_chart") {
+        const rangeAddress = args.data_range || args.range || resolveRangeAddress(args);
+        const dataRange = sheet.getRange(rangeAddress);
+        const chartTypeMap = {
+          area: Excel.ChartType.area,
+          bar: Excel.ChartType.barClustered,
+          column: Excel.ChartType.columnClustered,
+          line: Excel.ChartType.line,
+          pie: Excel.ChartType.pie,
+          scatter: Excel.ChartType.xyScatter,
+        };
+        const chartKey = String(args.chart_type || "bar").toLowerCase();
+        const chart = sheet.charts.add(chartTypeMap[chartKey] || chartTypeMap.bar || normalizeChartType(args.chart_type), dataRange, Excel.ChartSeriesBy.auto);
+        if (args.title) {
+          chart.title.text = String(args.title);
+          chart.title.visible = true;
+        }
+        if (args.x_axis && chart.axes && chart.axes.categoryAxis) {
+          chart.axes.categoryAxis.title.text = String(args.x_axis);
+        }
+        if (args.y_axis && chart.axes && chart.axes.valueAxis) {
+          chart.axes.valueAxis.title.text = String(args.y_axis);
+        }
+        const topLeft = args.target_cell || "H2";
+        chart.setPosition(topLeft, offsetCellAddress(topLeft, 16, 7));
+        executed += 1;
+        continue;
+      }
+
+      if (opName === "create_pivot_table") {
+        const rowsWritten = await writePivotSummary(context, sheet, args);
+        warnings.push(`Created summary sheet with ${rowsWritten} grouped row(s).`);
         executed += 1;
         continue;
       }
@@ -661,6 +962,14 @@ async function runOcrFlow() {
 }
 
 function bindEvents() {
+  document.querySelectorAll("[data-prompt]").forEach((button) => {
+    button.addEventListener("click", () => {
+      ui.chatInput.value = button.getAttribute("data-prompt") || "";
+      ui.chatInput.focus();
+      void sendChat();
+    });
+  });
+
   ui.sendBtn.addEventListener("click", () => {
     void sendChat();
   });

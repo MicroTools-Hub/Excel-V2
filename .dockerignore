@@ -1,0 +1,11 @@
+.git
+graphify-out
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.venv
+**/node_modules
+sources/mcp-server-excel-main
+sources/OfficeCLI-main

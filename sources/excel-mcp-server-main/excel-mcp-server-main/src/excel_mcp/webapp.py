@@ -9,21 +9,35 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import inspect
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 
 from excel_mcp.calculations import apply_formula as apply_formula_impl
+from excel_mcp.chart import create_chart_in_sheet as create_chart_impl
 from excel_mcp.data import read_excel_range, write_data
 from excel_mcp.formatting import format_range as format_range_impl
 from excel_mcp.ollama_client import OllamaClient
 from excel_mcp.smart_paste import parse_tabular_text
 from excel_mcp.workbook import create_sheet, create_workbook, get_workbook_info
-from excel_mcp import server as mcp_server_module
+from excel_mcp.pivot import create_pivot_table as create_pivot_table_impl
+from excel_mcp.tables import create_excel_table as create_table_impl
+from excel_mcp.sheet import (
+    copy_range_operation,
+    delete_range_operation,
+    insert_row,
+    insert_cols,
+    delete_rows,
+    delete_cols,
+    delete_sheet,
+    merge_range,
+    rename_sheet,
+    unmerge_range,
+)
 
 logger = logging.getLogger("excel-mcp.webapp")
 
@@ -34,12 +48,25 @@ _RANGE_REF_RE = re.compile(
 _SUPPORTED_OPERATION_NAMES = {
     "create_workbook",
     "create_worksheet",
+    "rename_worksheet",
+    "delete_worksheet",
     "write_data",
     "clear_range",
     "read_data",
     "apply_formula",
     "format_range",
+    "create_chart",
     "get_workbook_metadata",
+    "create_pivot_table",
+    "create_table",
+    "insert_rows",
+    "insert_columns",
+    "delete_sheet_rows",
+    "delete_sheet_columns",
+    "merge_cells",
+    "unmerge_cells",
+    "copy_range",
+    "delete_range",
 }
 
 
@@ -91,6 +118,8 @@ os.makedirs(EXCEL_FILES_BASE, exist_ok=True)
 
 APP_ROOT = Path(__file__).resolve().parent
 WEB_ROOT = APP_ROOT / "web"
+PROJECT_ROOT = APP_ROOT.parent.parent
+MANIFEST_TEMPLATE = PROJECT_ROOT / "manifest.xml"
 
 app = FastAPI(
     title="Excel Smart Add-in Backend",
@@ -254,13 +283,25 @@ def _validate_operation_pass_one(name: str, args: Dict[str, Any]) -> List[str]:
         errors.append("write_data requires data")
     if name == "apply_formula" and "formula" not in args:
         errors.append("apply_formula requires formula")
-    if name == "create_worksheet" and not args.get("sheet_name"):
-        errors.append("create_worksheet requires sheet_name")
+    if name in {"create_worksheet", "delete_worksheet"} and not args.get("sheet_name"):
+        errors.append(f"{name} requires sheet_name")
+    if name == "rename_worksheet" and not (args.get("old_name") and args.get("new_name")):
+        errors.append("rename_worksheet requires old_name and new_name")
 
     if name in {"clear_range", "format_range"} and not (
         args.get("range") or args.get("start_cell")
     ):
         errors.append(f"{name} requires range or start_cell")
+    if name == "create_chart":
+        for required in ("data_range", "chart_type", "target_cell"):
+            if not args.get(required):
+                errors.append(f"create_chart requires {required}")
+    if name == "create_table" and not (args.get("data_range") or args.get("range")):
+        errors.append("create_table requires data_range or range")
+    pivot_rows = args.get("rows") or args.get("row_fields")
+    pivot_values = args.get("values") or args.get("value_fields")
+    if name == "create_pivot_table" and not (pivot_rows and pivot_values):
+        errors.append("create_pivot_table requires rows and values")
 
     return errors
 
@@ -272,11 +313,24 @@ def _validate_operation_pass_two(name: str, args: Dict[str, Any], request: ChatR
     if request.auto_execute and name in {
         "create_workbook",
         "create_worksheet",
+        "rename_worksheet",
+        "delete_worksheet",
         "write_data",
         "clear_range",
         "read_data",
         "apply_formula",
         "format_range",
+        "create_chart",
+        "create_pivot_table",
+        "create_table",
+        "insert_rows",
+        "insert_columns",
+        "delete_sheet_rows",
+        "delete_sheet_columns",
+        "merge_cells",
+        "unmerge_cells",
+        "copy_range",
+        "delete_range",
         "get_workbook_metadata",
     }:
         if not isinstance(filepath, str) or not filepath.strip():
@@ -287,11 +341,24 @@ def _validate_operation_pass_two(name: str, args: Dict[str, Any], request: ChatR
     # In Excel-host mode (auto_execute=False), local execution can default to active sheet.
     if request.auto_execute and name in {
         "create_worksheet",
+        "rename_worksheet",
+        "delete_worksheet",
         "write_data",
         "clear_range",
         "read_data",
         "apply_formula",
         "format_range",
+        "create_chart",
+        "create_pivot_table",
+        "create_table",
+        "insert_rows",
+        "insert_columns",
+        "delete_sheet_rows",
+        "delete_sheet_columns",
+        "merge_cells",
+        "unmerge_cells",
+        "copy_range",
+        "delete_range",
     }:
         if not isinstance(args.get("sheet_name"), str) or not str(args.get("sheet_name")).strip():
             errors.append("sheet_name must be a non-empty string")
@@ -307,6 +374,12 @@ def _validate_operation_pass_two(name: str, args: Dict[str, Any], request: ChatR
 
     if "range" in args and args.get("range") and not _is_valid_range_ref(args.get("range")):
         errors.append("range is invalid")
+
+    if "data_range" in args and args.get("data_range") and not _is_valid_range_ref(args.get("data_range")):
+        errors.append("data_range is invalid")
+
+    if "target_cell" in args and args.get("target_cell") and not _is_valid_cell_ref(args.get("target_cell")):
+        errors.append("target_cell is invalid")
 
     if name == "write_data":
         data = args.get("data")
@@ -375,6 +448,16 @@ def _execute_operation(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         result = create_sheet(filepath, args["sheet_name"])
         return {"ok": True, "message": result.get("message", "Worksheet created")}
 
+    if operation == "rename_worksheet":
+        filepath = resolve_excel_path(args["filepath"])
+        result = rename_sheet(filepath, args["old_name"], args["new_name"])
+        return {"ok": True, "message": result.get("message", "Worksheet renamed")}
+
+    if operation == "delete_worksheet":
+        filepath = resolve_excel_path(args["filepath"])
+        result = delete_sheet(filepath, args["sheet_name"])
+        return {"ok": True, "message": result.get("message", "Worksheet deleted")}
+
     if operation == "write_data":
         filepath = resolve_excel_path(args["filepath"])
         result = write_data(
@@ -441,9 +524,16 @@ def _execute_operation(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"Sheet '{args['sheet_name']}' not found")
 
         ws = wb[args["sheet_name"]]
-        for row in ws[range_address]:
-            for cell in row:
-                cell.value = None
+        cells = ws[range_address]
+        if isinstance(cells, tuple):
+            for row in cells:
+                if isinstance(row, tuple):
+                    for cell in row:
+                        cell.value = None
+                else:
+                    row.value = None
+        else:
+            cells.value = None
 
         wb.save(filepath)
         wb.close()
@@ -453,6 +543,133 @@ def _execute_operation(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         filepath = resolve_excel_path(args["filepath"])
         info = get_workbook_info(filepath, include_ranges=bool(args.get("include_ranges", False)))
         return {"ok": True, "metadata": info}
+
+    if operation == "create_chart":
+        filepath = resolve_excel_path(args["filepath"])
+        result = create_chart_impl(
+            filepath=filepath,
+            sheet_name=args["sheet_name"],
+            data_range=args["data_range"],
+            chart_type=args.get("chart_type", "bar"),
+            target_cell=args.get("target_cell", "H2"),
+            title=args.get("title", ""),
+            x_axis=args.get("x_axis", ""),
+            y_axis=args.get("y_axis", ""),
+            style=args.get("style") if isinstance(args.get("style"), dict) else None,
+        )
+        return {"ok": True, "message": result.get("message", "Chart created")}
+
+    if operation == "create_pivot_table":
+        filepath = resolve_excel_path(args["filepath"])
+        result = create_pivot_table_impl(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            data_range=args.get("data_range"),
+            rows=args.get("rows") or args.get("row_fields") or [],
+            columns=args.get("columns") or args.get("column_fields") or [],
+            values=args.get("values") or args.get("value_fields") or [],
+            agg_func=args.get("agg_func", "sum"),
+        )
+        return {"ok": True, "message": result.get("message", "Pivot table created")}
+
+    if operation == "create_table":
+        filepath = resolve_excel_path(args["filepath"])
+        data_range = args.get("data_range") or args.get("range")
+        if not data_range and args.get("start_cell") and args.get("end_cell"):
+            data_range = f"{args['start_cell']}:{args['end_cell']}"
+        if not data_range:
+            raise ValueError("create_table requires data_range or range")
+        result = create_table_impl(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            data_range=data_range,
+            table_name=args.get("table_name"),
+            table_style=args.get("table_style", "TableStyleMedium9"),
+        )
+        return {"ok": True, "message": result.get("message", "Table created")}
+
+    if operation == "insert_rows":
+        filepath = resolve_excel_path(args["filepath"])
+        result = insert_row(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            start_row=args.get("start_row", 1),
+            count=args.get("count", 1),
+        )
+        return {"ok": True, "message": result.get("message", "Rows inserted")}
+
+    if operation == "insert_columns":
+        filepath = resolve_excel_path(args["filepath"])
+        result = insert_cols(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            start_col=args.get("start_col", 1),
+            count=args.get("count", 1),
+        )
+        return {"ok": True, "message": result.get("message", "Columns inserted")}
+
+    if operation == "delete_sheet_rows":
+        filepath = resolve_excel_path(args["filepath"])
+        result = delete_rows(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            start_row=args.get("start_row", 1),
+            count=args.get("count", 1),
+        )
+        return {"ok": True, "message": result.get("message", "Rows deleted")}
+
+    if operation == "delete_sheet_columns":
+        filepath = resolve_excel_path(args["filepath"])
+        result = delete_cols(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            start_col=args.get("start_col", 1),
+            count=args.get("count", 1),
+        )
+        return {"ok": True, "message": result.get("message", "Columns deleted")}
+
+    if operation == "merge_cells":
+        filepath = resolve_excel_path(args["filepath"])
+        result = merge_range(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            start_cell=args.get("start_cell"),
+            end_cell=args.get("end_cell"),
+        )
+        return {"ok": True, "message": result.get("message", "Cells merged")}
+
+    if operation == "unmerge_cells":
+        filepath = resolve_excel_path(args["filepath"])
+        result = unmerge_range(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            start_cell=args.get("start_cell"),
+            end_cell=args.get("end_cell"),
+        )
+        return {"ok": True, "message": result.get("message", "Cells unmerged")}
+
+    if operation == "copy_range":
+        filepath = resolve_excel_path(args["filepath"])
+        result = copy_range_operation(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            source_start=args.get("source_start"),
+            source_end=args.get("source_end"),
+            target_start=args.get("target_start"),
+            target_sheet=args.get("target_sheet"),
+        )
+        return {"ok": True, "message": result.get("message", "Range copied")}
+
+    if operation == "delete_range":
+        filepath = resolve_excel_path(args["filepath"])
+        result = delete_range_operation(
+            filepath=filepath,
+            sheet_name=args.get("sheet_name"),
+            start_cell=args.get("start_cell"),
+            end_cell=args.get("end_cell"),
+            shift_direction=args.get("shift_direction", "up"),
+        )
+        return {"ok": True, "message": result.get("message", "Range deleted")}
 
     # Fallback: try dispatching any existing Excel MCP tool from server.py.
     blocked = {
@@ -464,6 +681,8 @@ def _execute_operation(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     }
     if operation in blocked:
         raise ValueError(f"Unsupported operation: {name}")
+
+    from excel_mcp import server as mcp_server_module
 
     candidate = getattr(mcp_server_module, operation, None)
     if callable(candidate):
@@ -490,16 +709,42 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
 
     system_content = (
         "You are Excel Copilot running on top of DeepSeek via Ollama. "
-        "Respond with practical spreadsheet guidance. "
+        "You are EXTREMELY SMART and understand vague prompts like a human Excel expert. "
+        "When users ask for calculations (averages, sums, counts, etc.), you MUST: "
+        "1. First understand the data structure by examining sheet_snapshot or using read_data if needed "
+        "2. Determine appropriate Excel ranges for the calculation "
+        "3. Apply correct Excel formulas using apply_formula operation "
+        "4. Write results to appropriate cells using write_data if needed "
+        ""
+        "EXAMPLES OF SMART BEHAVIOR: "
+        "- User says 'average of all subjects': Find all subject columns, calculate row-wise averages for each student, write results in new column "
+        "- User says 'sum everything': Calculate total sum of all numeric data, place result in logical location "
+        "- User says 'format everything properly': Apply consistent formatting (bold headers, borders, number formatting) "
+        "- User says 'make it look nice': Auto-fit columns, apply clean formatting, add subtle colors "
+        "- User gives short vague prompt: Interpret intent generously and perform complete, polished actions "
+        ""
         "When an operation should be executed, include an XML-like plan block exactly in this format: "
         "<excel_plan>{\"assistant_reply\":\"...\",\"operations\":[{\"name\":\"write_data\",\"args\":{...}}]}</excel_plan>. "
+        ""
         "Before returning operations, internally verify each operation twice for required args and reference validity. "
         "If the user asks to modify or format data, include at least one actionable operation (for example format_range, write_data, clear_range, or apply_formula). "
         "When live sheet_snapshot context is present, avoid read_data/get_workbook_metadata unless strictly necessary. "
-        "Supported operation names: create_workbook, create_worksheet, write_data, clear_range, read_data, apply_formula, format_range, get_workbook_metadata. "
+        ""
+        "SUPPORTED OPERATION NAMES: create_workbook, create_worksheet, rename_worksheet, delete_worksheet, write_data, clear_range, read_data, apply_formula, format_range, create_chart, get_workbook_metadata, create_pivot_table, create_table, insert_rows, insert_columns, delete_sheet_rows, delete_sheet_columns, merge_cells, unmerge_cells, copy_range, delete_range. "
+        ""
+        "CALCULATION PATTERNS: "
+        "- For row calculations (averages per student): Use apply_formula with formulas like =AVERAGE(B2:D2) "
+        "- For column calculations (totals per subject): Use apply_formula with formulas like =SUM(B2:B10) "
+        "- For charts: Use create_chart with {data_range, chart_type, target_cell, title}. "
+        "- For native Excel tables: Use create_table with {data_range, table_name, table_style}. "
+        "- For complex aggregations: Use create_pivot_table with {data_range, rows, values, columns, agg_func}. "
+        "- Always write results to logical locations (next empty column for row calculations, below data for column totals) "
+        ""
         "For write_data, prefer args {start_cell, data, optional sheet_name}; use range only when explicitly requested. "
         "For clearing cells, prefer clear_range with args {range, optional sheet_name}. "
         "If no operation is needed, operations must be an empty list."
+        ""
+        "BE PROACTIVE: If user asks for something vague like 'make it better' or 'fix this', examine the data and apply appropriate improvements (formatting, calculations, organization)."
     )
 
     model_messages: List[Dict[str, str]] = [{"role": "system", "content": system_content}]
@@ -1144,6 +1389,28 @@ def root() -> Any:
     if WEB_ROOT.exists():
         return RedirectResponse(url="/ui/taskpane.html")
     return {"status": "ok", "message": "UI files missing"}
+
+
+@app.get("/manifest.xml", include_in_schema=False)
+def manifest(request: Request) -> Response:
+    if not MANIFEST_TEMPLATE.exists():
+        raise HTTPException(status_code=404, detail="manifest.xml not found")
+
+    public_base_url = os.environ.get("PUBLIC_BASE_URL")
+    if public_base_url:
+        base_url = public_base_url.strip().rstrip("/")
+    else:
+        base_url = str(request.base_url).rstrip("/")
+
+    xml = MANIFEST_TEMPLATE.read_text(encoding="utf-8")
+    for placeholder in (
+        "https://excel-v2.onrender.com",
+        "https://smart-excel-copilot.onrender.com",
+        "https://your-render-service.onrender.com",
+        "https://localhost:3000",
+    ):
+        xml = xml.replace(placeholder, base_url)
+    return Response(content=xml, media_type="application/xml")
 
 
 @app.get("/ui/taskpane.html", include_in_schema=False)

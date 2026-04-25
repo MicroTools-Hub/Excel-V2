@@ -10,6 +10,7 @@
   --user-bubble: #edfff9;
   --assistant-bubble: #fff;
   --danger: #a64141;
+  --shadow: 0 18px 42px rgba(33, 42, 34, 0.12);
 }
 
 * {
@@ -23,53 +24,10 @@ body {
   min-height: 100%;
   font-family: "Space Grotesk", "Segoe UI", sans-serif;
   color: var(--text-main);
-  background: radial-gradient(circle at 20% 10%, #fef9ea 0%, #f7f8f3 40%, #eef2e8 100%);
-}
-
-.bg-orb {
-  position: fixed;
-  pointer-events: none;
-  border-radius: 50%;
-  filter: blur(40px);
-  z-index: 0;
-}
-
-.bg-orb-a {
-  width: 260px;
-  height: 260px;
-  top: -60px;
-  left: -40px;
-  background: rgba(13, 102, 91, 0.28);
-  animation: driftA 12s ease-in-out infinite;
-}
-
-.bg-orb-b {
-  width: 300px;
-  height: 300px;
-  right: -70px;
-  bottom: -90px;
-  background: rgba(215, 127, 47, 0.24);
-  animation: driftB 14s ease-in-out infinite;
-}
-
-@keyframes driftA {
-  0%,
-  100% {
-    transform: translateY(0px) translateX(0px);
-  }
-  50% {
-    transform: translateY(14px) translateX(10px);
-  }
-}
-
-@keyframes driftB {
-  0%,
-  100% {
-    transform: translateY(0px) translateX(0px);
-  }
-  50% {
-    transform: translateY(-16px) translateX(-8px);
-  }
+  background:
+    linear-gradient(135deg, rgba(13, 102, 91, 0.1), transparent 36%),
+    linear-gradient(315deg, rgba(215, 127, 47, 0.12), transparent 34%),
+    #f7f8f3;
 }
 
 .app-shell {
@@ -98,7 +56,7 @@ body {
   margin: 0;
   display: inline-block;
   padding: 4px 10px;
-  border-radius: 999px;
+  border-radius: 8px;
   background: #1f3330;
   color: #ecf5f1;
   font-family: "IBM Plex Mono", monospace;
@@ -108,7 +66,7 @@ body {
 .status-pill {
   border: 1px solid var(--line);
   background: #fff;
-  border-radius: 999px;
+  border-radius: 8px;
   padding: 8px 12px;
   font-family: "IBM Plex Mono", monospace;
   font-size: 0.76rem;
@@ -123,10 +81,10 @@ body {
 
 .glass {
   border: 1px solid rgba(255, 255, 255, 0.6);
-  box-shadow: 0 20px 45px rgba(30, 40, 34, 0.1);
+  box-shadow: var(--shadow);
   background: var(--bg-panel);
   backdrop-filter: blur(8px);
-  border-radius: 16px;
+  border-radius: 8px;
 }
 
 .chat-panel {
@@ -148,7 +106,7 @@ body {
 .message {
   max-width: 90%;
   padding: 10px 12px;
-  border-radius: 12px;
+  border-radius: 8px;
   border: 1px solid var(--line);
   line-height: 1.45;
   animation: reveal 160ms ease-out;
@@ -189,11 +147,33 @@ body {
   padding-top: 10px;
 }
 
+.quick-actions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+  margin-bottom: 8px;
+}
+
+.quick-btn {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text-main);
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.quick-btn:hover {
+  border-color: var(--brand);
+}
+
 .composer {
   width: 100%;
   min-height: 94px;
   resize: vertical;
-  border-radius: 12px;
+  border-radius: 8px;
   border: 1px solid var(--line);
   padding: 11px;
   font: inherit;
@@ -233,7 +213,7 @@ label {
 input,
 textarea {
   width: 100%;
-  border-radius: 10px;
+  border-radius: 8px;
   border: 1px solid var(--line);
   padding: 9px 10px;
   font: inherit;
@@ -253,7 +233,7 @@ textarea {
 }
 
 .btn {
-  border-radius: 10px;
+  border-radius: 8px;
   border: 1px solid transparent;
   padding: 9px 12px;
   font-family: "Space Grotesk", sans-serif;
@@ -288,7 +268,7 @@ textarea {
   max-height: 180px;
   overflow: auto;
   border: 1px dashed var(--line);
-  border-radius: 10px;
+  border-radius: 8px;
   background: #fff;
 }
 
@@ -317,6 +297,10 @@ textarea {
 @media (max-width: 1020px) {
   .layout {
     grid-template-columns: 1fr;
+  }
+
+  .quick-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .chat-panel,

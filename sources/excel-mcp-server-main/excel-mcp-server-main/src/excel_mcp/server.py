@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 from typing import Any, List, Dict, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -53,15 +54,21 @@ LOG_FILE = os.path.join(ROOT_DIR, "excel-mcp.log")
 # Initialize EXCEL_FILES_PATH variable without assigning a value
 EXCEL_FILES_PATH = None
 
+def _build_log_handlers() -> list[logging.Handler]:
+    for candidate in (LOG_FILE, os.path.join(tempfile.gettempdir(), "excel-mcp.log")):
+        try:
+            return [logging.FileHandler(candidate)]
+        except OSError:
+            continue
+    return [logging.NullHandler()]
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        # Referring to https://github.com/modelcontextprotocol/python-sdk/issues/409#issuecomment-2816831318
-        # The stdio mode server MUST NOT write anything to its stdout that is not a valid MCP message.
-        logging.FileHandler(LOG_FILE)
-    ],
+    # The stdio mode server must not write anything to stdout that is not a valid MCP message.
+    handlers=_build_log_handlers(),
 )
 logger = logging.getLogger("excel-mcp")
 # Initialize FastMCP server

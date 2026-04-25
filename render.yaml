@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: smart-excel-copilot
+    env: docker
+    plan: starter
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: OLLAMA_BASE_URL
+        value: https://ollama.com
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_MODEL
+        value: deepseek-v3.2:cloud
+      - key: OLLAMA_TIMEOUT_SECONDS
+        value: "120"
+      - key: PUBLIC_BASE_URL
+        value: https://smart-excel-copilot.onrender.com
+      - key: EXCEL_FILES_PATH
+        value: /data/excel_files
+      - key: WEBAPP_HOST
+        value: 0.0.0.0
