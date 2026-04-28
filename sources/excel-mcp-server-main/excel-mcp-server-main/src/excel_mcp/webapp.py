@@ -81,6 +81,7 @@ class ChatRequest(BaseModel):
     sheet_name: Optional[str] = None
     start_cell: str = "A1"
     sheet_snapshot: Optional[Dict[str, Any]] = None
+    image_context: Optional[Dict[str, Any]] = None
     auto_execute: bool = True
 
 
@@ -102,7 +103,7 @@ class ParseTextRequest(BaseModel):
 
 class OcrRequest(BaseModel):
     image_base64: str
-    use_ai_layout: bool = True
+    use_ai_layout: bool = False
 
 
 class OcrPasteRequest(BaseModel):
@@ -110,7 +111,7 @@ class OcrPasteRequest(BaseModel):
     sheet_name: str
     start_cell: str = "A1"
     image_base64: str
-    use_ai_layout: bool = True
+    use_ai_layout: bool = False
 
 
 EXCEL_FILES_BASE = os.path.realpath(os.environ.get("EXCEL_FILES_PATH", "./excel_files"))
@@ -220,17 +221,40 @@ def _compact_sheet_snapshot(snapshot: Dict[str, Any], max_rows: int = 120, max_c
 
     return {
         "sheet_name": snapshot.get("sheet_name"),
+        "sheet_names": snapshot.get("sheet_names", [])[:32] if isinstance(snapshot.get("sheet_names"), list) else [],
         "selection_address": snapshot.get("selection_address"),
         "selection_start_cell": snapshot.get("selection_start_cell"),
+        "selection_preview_address": snapshot.get("selection_preview_address"),
+        "selection_preview_row_count": snapshot.get("selection_preview_row_count"),
+        "selection_preview_column_count": snapshot.get("selection_preview_column_count"),
+        "selection_values": trim_matrix(snapshot.get("selection_values", [])),
+        "selection_formulas": trim_matrix(snapshot.get("selection_formulas", [])),
         "used_range_address": snapshot.get("used_range_address"),
+        "preview_address": snapshot.get("preview_address"),
         "row_count": row_count,
         "column_count": col_count,
-        "snapshot_mode": "compact",
+        "snapshot_mode": snapshot.get("snapshot_mode") or "compact",
         "truncated": truncated,
         "max_rows": max_rows,
         "max_cols": max_cols,
         "values": trim_matrix(snapshot.get("values", [])),
         "formulas": trim_matrix(snapshot.get("formulas", [])),
+    }
+
+
+def _compact_image_context(image_context: Dict[str, Any], max_rows: int = 80, max_cols: int = 16) -> Dict[str, Any]:
+    rows = image_context.get("rows", [])
+    normalized_rows = _normalize_table_rows(rows, max_rows=max_rows, max_cols=max_cols)
+    text = str(image_context.get("extracted_text") or "").strip()
+
+    return {
+        "file_name": image_context.get("file_name"),
+        "ocr_engine": image_context.get("ocr_engine"),
+        "layout_source": image_context.get("layout_source"),
+        "row_count": image_context.get("row_count"),
+        "column_count": image_context.get("column_count"),
+        "rows": normalized_rows,
+        "extracted_text": text[:6000],
     }
 
 
@@ -721,6 +745,7 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
     system_content = (
         "You are Excel Copilot running on top of DeepSeek via Ollama. "
         "You are EXTREMELY SMART and understand vague prompts like a human Excel expert. "
+        "For every user command, first read the latest active-sheet snapshot that accompanies the request before deciding what to do. "
         "When users ask for calculations (averages, sums, counts, etc.), you MUST: "
         "1. First understand the data structure by examining sheet_snapshot or using read_data if needed "
         "2. Determine appropriate Excel ranges for the calculation "
@@ -741,6 +766,7 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
         "If auto_execute is false, the user is working in a live Excel workbook, so NEVER use create_workbook. "
         "If the user asks to modify or format data, include at least one actionable operation (for example format_range, write_data, clear_range, or apply_formula). "
         "When live sheet_snapshot context is present, avoid read_data/get_workbook_metadata unless strictly necessary. "
+        "If image_context is present, it comes from OCR extracted from a user-provided image. Use it as additional evidence, but treat the live sheet snapshot as the workbook source of truth. "
         ""
         "SUPPORTED OPERATION NAMES: create_workbook, create_worksheet, rename_worksheet, delete_worksheet, write_data, clear_range, read_data, apply_formula, format_range, create_chart, get_workbook_metadata, create_pivot_table, create_table, insert_rows, insert_columns, delete_sheet_rows, delete_sheet_columns, merge_cells, unmerge_cells, copy_range, delete_range. "
         ""
@@ -779,9 +805,17 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
         try:
             snapshot_context = {
                 "sheet_name": request.sheet_snapshot.get("sheet_name"),
+                "sheet_names": request.sheet_snapshot.get("sheet_names", []),
                 "selection_address": request.sheet_snapshot.get("selection_address"),
                 "selection_start_cell": request.sheet_snapshot.get("selection_start_cell"),
+                "selection_preview_address": request.sheet_snapshot.get("selection_preview_address"),
+                "selection_preview_row_count": request.sheet_snapshot.get("selection_preview_row_count"),
+                "selection_preview_column_count": request.sheet_snapshot.get("selection_preview_column_count"),
+                "selection_values": request.sheet_snapshot.get("selection_values", []),
+                "selection_formulas": request.sheet_snapshot.get("selection_formulas", []),
                 "used_range_address": request.sheet_snapshot.get("used_range_address"),
+                "preview_address": request.sheet_snapshot.get("preview_address"),
+                "snapshot_mode": request.sheet_snapshot.get("snapshot_mode"),
                 "row_count": request.sheet_snapshot.get("row_count"),
                 "column_count": request.sheet_snapshot.get("column_count"),
                 "values": request.sheet_snapshot.get("values", []),
@@ -799,6 +833,22 @@ async def _run_llm_chat(request: ChatRequest) -> Dict[str, Any]:
             )
         except Exception as exc:
             logger.warning("Could not attach sheet snapshot context: %s", exc)
+
+    if request.image_context:
+        try:
+            compact_image_context = _compact_image_context(request.image_context)
+            model_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Latest OCR-derived image context from the user. "
+                        "Use this as supporting information for the prompt: "
+                        + json.dumps(compact_image_context, default=str)
+                    ),
+                }
+            )
+        except Exception as exc:
+            logger.warning("Could not attach image context: %s", exc)
 
     for msg in request.messages[-24:]:
         model_messages.append({"role": msg.role, "content": msg.content})
@@ -1267,7 +1317,7 @@ async def _ai_refine_ocr_rows(
     )
 
     try:
-        llm = OllamaClient(timeout_seconds=90)
+        llm = OllamaClient(timeout_seconds=25)
         response = await llm.chat(
             [
                 {"role": "system", "content": system_prompt},
@@ -1346,7 +1396,7 @@ def _run_tesseract_ocr(image_base64: str) -> Dict[str, Any]:
     }
 
 
-async def _extract_structured_ocr(image_base64: str, use_ai_layout: bool = True) -> Dict[str, Any]:
+async def _extract_structured_ocr(image_base64: str, use_ai_layout: bool = False) -> Dict[str, Any]:
     ocr = await run_in_threadpool(_run_tesseract_ocr, image_base64)
     text = str(ocr.get("text") or "").strip()
     word_boxes = ocr.get("word_boxes") if isinstance(ocr.get("word_boxes"), list) else []
@@ -1355,7 +1405,7 @@ async def _extract_structured_ocr(image_base64: str, use_ai_layout: bool = True)
     box_rows = _table_from_word_boxes(word_boxes, int(ocr.get("image_width") or 0))
     ai_rows: List[List[Any]] = []
 
-    if use_ai_layout:
+    if use_ai_layout and (len(word_boxes) >= 8 or len(text_rows) >= 3):
         seed_rows = box_rows if box_rows else text_rows
         ai_rows = await _ai_refine_ocr_rows(text, word_boxes, seed_rows)
 

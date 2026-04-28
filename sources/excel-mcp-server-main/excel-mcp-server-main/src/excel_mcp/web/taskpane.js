@@ -3,11 +3,25 @@ const state = {
   parsedRows: [],
   isExcelHost: false,
   isBusy: false,
+  lastSheetSnapshot: null,
+  latestImageContext: null,
 };
+
+const OCR_SERVER_TIMEOUT_MS = 12000;
+const OCR_BROWSER_TIMEOUT_MS = 45000;
+const OCR_MAX_IMAGE_EDGE = 1800;
+const SHEET_SNAPSHOT_MAX_ROWS = 120;
+const SHEET_SNAPSHOT_MAX_COLS = 24;
+const SHEET_SELECTION_MAX_ROWS = 30;
+const SHEET_SELECTION_MAX_COLS = 12;
+const IMAGE_CONTEXT_MAX_ROWS = 80;
+const IMAGE_CONTEXT_MAX_COLS = 16;
+const IMAGE_CONTEXT_TEXT_MAX_CHARS = 6000;
 
 const ui = {
   messages: document.getElementById("messages"),
   chatInput: document.getElementById("chatInput"),
+  chatImageBtn: document.getElementById("chatImageBtn"),
   sendBtn: document.getElementById("sendBtn"),
   clearChatBtn: document.getElementById("clearChatBtn"),
   officeStatus: document.getElementById("officeStatus"),
@@ -45,6 +59,7 @@ function setBusy(isBusy, statusMessage = "") {
   state.isBusy = Boolean(isBusy);
 
   ui.chatInput.disabled = state.isBusy;
+  ui.chatImageBtn.disabled = state.isBusy;
   ui.sendBtn.disabled = state.isBusy;
   ui.clearChatBtn.disabled = state.isBusy;
   ui.filepathInput.disabled = state.isBusy;
@@ -731,24 +746,57 @@ async function collectExcelSheetSnapshot() {
 
   return Excel.run(async (context) => {
     const workbook = context.workbook;
+    const worksheets = workbook.worksheets;
     const activeSheet = workbook.worksheets.getActiveWorksheet();
     const selectedRange = workbook.getSelectedRange();
     const usedRange = activeSheet.getUsedRangeOrNullObject(true);
 
     activeSheet.load("name");
-    selectedRange.load("address");
-    usedRange.load("isNullObject,address,rowCount,columnCount,values,formulas");
+    worksheets.load("items/name");
+    selectedRange.load("address,rowCount,columnCount");
+    usedRange.load("isNullObject,address,rowCount,columnCount");
     await context.sync();
 
     const selectionAddress = selectedRange.address || "A1";
     const selectionStartCell = getRangeStartCell(selectionAddress);
+    const selectionPreviewRows = Math.max(1, Math.min(Number(selectedRange.rowCount || 1), SHEET_SELECTION_MAX_ROWS));
+    const selectionPreviewCols = Math.max(1, Math.min(Number(selectedRange.columnCount || 1), SHEET_SELECTION_MAX_COLS));
+    const selectionPreviewRange = selectedRange
+      .getCell(0, 0)
+      .getResizedRange(selectionPreviewRows - 1, selectionPreviewCols - 1);
+
+    selectionPreviewRange.load("address,rowCount,columnCount,values,formulas");
+
+    let usedPreviewRange = null;
+    if (!usedRange.isNullObject) {
+      const previewRows = Math.max(1, Math.min(Number(usedRange.rowCount || 1), SHEET_SNAPSHOT_MAX_ROWS));
+      const previewCols = Math.max(1, Math.min(Number(usedRange.columnCount || 1), SHEET_SNAPSHOT_MAX_COLS));
+      usedPreviewRange = usedRange
+        .getCell(0, 0)
+        .getResizedRange(previewRows - 1, previewCols - 1);
+      usedPreviewRange.load("address,rowCount,columnCount,values,formulas");
+    }
+
+    await context.sync();
+
+    const sheetNames = Array.isArray(worksheets.items)
+      ? worksheets.items.map((sheet) => String(sheet.name || "")).filter(Boolean)
+      : [];
 
     if (usedRange.isNullObject) {
       return {
         sheet_name: activeSheet.name,
+        sheet_names: sheetNames,
         selection_address: selectionAddress,
         selection_start_cell: selectionStartCell,
+        selection_preview_address: selectionPreviewRange.address,
+        selection_preview_row_count: selectionPreviewRange.rowCount,
+        selection_preview_column_count: selectionPreviewRange.columnCount,
+        selection_values: selectionPreviewRange.values,
+        selection_formulas: selectionPreviewRange.formulas,
         used_range_address: null,
+        preview_address: null,
+        snapshot_mode: "empty",
         row_count: 0,
         column_count: 0,
         values: [],
@@ -758,13 +806,26 @@ async function collectExcelSheetSnapshot() {
 
     return {
       sheet_name: activeSheet.name,
+      sheet_names: sheetNames,
       selection_address: selectionAddress,
       selection_start_cell: selectionStartCell,
+      selection_preview_address: selectionPreviewRange.address,
+      selection_preview_row_count: selectionPreviewRange.rowCount,
+      selection_preview_column_count: selectionPreviewRange.columnCount,
+      selection_values: selectionPreviewRange.values,
+      selection_formulas: selectionPreviewRange.formulas,
       used_range_address: usedRange.address,
+      preview_address: usedPreviewRange ? usedPreviewRange.address : usedRange.address,
+      snapshot_mode: (
+        Number(usedRange.rowCount || 0) > SHEET_SNAPSHOT_MAX_ROWS
+        || Number(usedRange.columnCount || 0) > SHEET_SNAPSHOT_MAX_COLS
+      )
+        ? "bounded"
+        : "full",
       row_count: usedRange.rowCount,
       column_count: usedRange.columnCount,
-      values: usedRange.values,
-      formulas: usedRange.formulas,
+      values: usedPreviewRange ? usedPreviewRange.values : [],
+      formulas: usedPreviewRange ? usedPreviewRange.formulas : [],
     };
   });
 }
@@ -1063,30 +1124,31 @@ async function sendChat() {
     return;
   }
 
-  return runBusyTask("Thinking...", async () => {
+  return runBusyTask("Reading the active sheet...", async () => {
     appendMessage("user", prompt);
     state.messages.push({ role: "user", content: prompt });
     ui.chatInput.value = "";
 
     try {
+      const config = getWorkbookConfig();
+      let sheetSnapshot = null;
+
+      if (state.isExcelHost) {
+        updateStatus(ui.actionStatus, "Reading active sheet context...");
+        try {
+          sheetSnapshot = await collectExcelSheetSnapshot();
+          state.lastSheetSnapshot = sheetSnapshot;
+        } catch (error) {
+          throw new Error(`Could not read the active sheet before sending the command: ${error.message}`);
+        }
+      }
+
       const localResult = await tryHandleLocalCopilotIntent(prompt);
       if (localResult) {
         appendMessage("assistant", localResult.reply);
         state.messages.push({ role: "assistant", content: localResult.reply });
         updateStatus(ui.actionStatus, localResult.status || "Applied changes to active workbook.");
         return;
-      }
-
-      const config = getWorkbookConfig();
-      let sheetSnapshot = null;
-
-      if (state.isExcelHost) {
-        try {
-          updateStatus(ui.actionStatus, "Reading full sheet context...");
-          sheetSnapshot = await collectExcelSheetSnapshot();
-        } catch (error) {
-          appendMessage("system", `Warning: Could not read full sheet context: ${error.message}`);
-        }
       }
 
       const effectiveSheetName =
@@ -1105,9 +1167,11 @@ async function sendChat() {
         sheet_name: effectiveSheetName,
         start_cell: effectiveStartCell,
         sheet_snapshot: sheetSnapshot,
+        image_context: state.latestImageContext,
         auto_execute: !state.isExcelHost,
       };
 
+      updateStatus(ui.actionStatus, "Thinking with the latest sheet context...");
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1230,6 +1294,101 @@ function fileToDataUrl(file) {
   });
 }
 
+function loadImageFromDataUrl(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Failed to load image for OCR processing."));
+    image.src = dataUrl;
+  });
+}
+
+async function optimizeImageForOcr(dataUrl) {
+  const image = await loadImageFromDataUrl(dataUrl);
+  const width = Number(image.naturalWidth || image.width || 0);
+  const height = Number(image.naturalHeight || image.height || 0);
+
+  if (!width || !height) {
+    return {
+      imageBase64: dataUrl,
+      width: 0,
+      height: 0,
+      scaled: false,
+    };
+  }
+
+  const maxEdge = Math.max(width, height);
+  if (maxEdge <= OCR_MAX_IMAGE_EDGE) {
+    return {
+      imageBase64: dataUrl,
+      width,
+      height,
+      scaled: false,
+    };
+  }
+
+  const scale = OCR_MAX_IMAGE_EDGE / maxEdge;
+  const targetWidth = Math.max(1, Math.round(width * scale));
+  const targetHeight = Math.max(1, Math.round(height * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) {
+    return {
+      imageBase64: dataUrl,
+      width,
+      height,
+      scaled: false,
+    };
+  }
+
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, targetWidth, targetHeight);
+  context.drawImage(image, 0, 0, targetWidth, targetHeight);
+
+  return {
+    imageBase64: canvas.toDataURL("image/png"),
+    width: targetWidth,
+    height: targetHeight,
+    scaled: true,
+    originalWidth: width,
+    originalHeight: height,
+  };
+}
+
+async function fetchJsonWithTimeout(url, init, timeoutMs) {
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timeoutHandle = controller
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+
+  try {
+    const response = await fetch(url, {
+      ...init,
+      signal: controller ? controller.signal : undefined,
+    });
+
+    if (!response.ok) {
+      const payload = await response.text();
+      throw new Error(payload || `Request failed (${response.status})`);
+    }
+
+    return response.json();
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
+
 function rowsToTsv(rows) {
   if (!Array.isArray(rows) || !rows.length) {
     return "";
@@ -1241,6 +1400,37 @@ function rowsToTsv(rows) {
       return cells.map((cell) => String(cell ?? "")).join("\t");
     })
     .join("\n");
+}
+
+function trimRowsForContext(rows, maxRows = IMAGE_CONTEXT_MAX_ROWS, maxCols = IMAGE_CONTEXT_MAX_COLS) {
+  const rectangular = toRectangularData(rows);
+  return rectangular
+    .slice(0, maxRows)
+    .map((row) => row.slice(0, maxCols).map((cell) => String(cell ?? "").trim()));
+}
+
+function truncateText(value, maxChars = IMAGE_CONTEXT_TEXT_MAX_CHARS) {
+  const text = String(value ?? "").trim();
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return `${text.slice(0, maxChars)}...`;
+}
+
+function setLatestImageContext(fileName, imageResult) {
+  const rows = trimRowsForContext(imageResult.rows || []);
+  const payload = imageResult.payload || {};
+  const text = truncateText(payload.text || "");
+
+  state.latestImageContext = {
+    file_name: String(fileName || "image"),
+    extracted_text: text,
+    rows,
+    row_count: Array.isArray(imageResult.rows) ? imageResult.rows.length : 0,
+    column_count: Array.isArray(imageResult.rows) && imageResult.rows.length ? imageResult.rows[0].length : 0,
+    ocr_engine: payload.ocr_engine || "ocr",
+    layout_source: payload.layout_source || "text",
+  };
 }
 
 function normalizeOcrCellText(value) {
@@ -1375,21 +1565,18 @@ function rowsFromOcrPayload(payload) {
 }
 
 async function requestServerOcr(imageBase64) {
-  const response = await fetch("/api/ocr-text", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      image_base64: imageBase64,
-      use_ai_layout: true,
-    }),
-  });
-
-  if (!response.ok) {
-    const payload = await response.text();
-    throw new Error(payload || `OCR request failed (${response.status})`);
-  }
-
-  return response.json();
+  return fetchJsonWithTimeout(
+    "/api/ocr-text",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image_base64: imageBase64,
+        use_ai_layout: false,
+      }),
+    },
+    OCR_SERVER_TIMEOUT_MS,
+  );
 }
 
 async function requestBrowserOcr(imageBase64) {
@@ -1397,49 +1584,95 @@ async function requestBrowserOcr(imageBase64) {
     throw new Error("Browser OCR fallback is unavailable because Tesseract.js did not load.");
   }
 
-  const result = await window.Tesseract.recognize(imageBase64, "eng", {
-    logger(message) {
-      if (!message || !message.status) {
-        return;
-      }
-      const progress = Number.isFinite(message.progress)
-        ? ` ${Math.round(message.progress * 100)}%`
-        : "";
-      updateStatus(ui.ocrStatus, `Browser OCR: ${message.status}${progress}`);
-    },
-  });
+  let timeoutHandle = null;
+  try {
+    const result = await Promise.race([
+      window.Tesseract.recognize(imageBase64, "eng", {
+        logger(message) {
+          if (!message || !message.status) {
+            return;
+          }
+          const progress = Number.isFinite(message.progress)
+            ? ` ${Math.round(message.progress * 100)}%`
+            : "";
+          updateStatus(ui.ocrStatus, `Browser OCR: ${message.status}${progress}`);
+        },
+      }),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new Error(`Browser OCR timed out after ${Math.round(OCR_BROWSER_TIMEOUT_MS / 1000)}s`));
+        }, OCR_BROWSER_TIMEOUT_MS);
+      }),
+    ]);
 
-  const text = String((result && result.data && result.data.text) || "").trim();
-  const words = Array.isArray(result && result.data && result.data.words) ? result.data.words : [];
-  const geometryRows = buildRowsFromBrowserOcr(words);
-  const textRows = parseTabularText(text);
-  const rows = geometryRows.length ? geometryRows : textRows;
+    const text = String((result && result.data && result.data.text) || "").trim();
+    const words = Array.isArray(result && result.data && result.data.words) ? result.data.words : [];
+    const geometryRows = buildRowsFromBrowserOcr(words);
+    const textRows = parseTabularText(text);
+    const rows = geometryRows.length ? geometryRows : textRows;
 
-  return {
-    text,
-    rows,
-    line_count: text ? text.split(/\r?\n/).filter((line) => line.trim()).length : 0,
-    layout_source: geometryRows.length ? "browser-geometry" : "browser-text",
-    ocr_engine: "tesseract.js",
-    word_count: words.length,
-  };
+    return {
+      text,
+      rows,
+      line_count: text ? text.split(/\r?\n/).filter((line) => line.trim()).length : 0,
+      layout_source: geometryRows.length ? "browser-geometry" : "browser-text",
+      ocr_engine: "tesseract.js",
+      word_count: words.length,
+    };
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
 }
 
 async function requestStructuredOcr(imageBase64) {
   try {
+    updateStatus(ui.ocrStatus, "Trying fast server OCR...");
     const serverPayload = await requestServerOcr(imageBase64);
     if (rowsFromOcrPayload(serverPayload).length) {
       return serverPayload;
     }
 
+    updateStatus(ui.ocrStatus, "Server OCR returned weak output. Switching to browser OCR...");
     const fallbackPayload = await requestBrowserOcr(imageBase64);
     fallbackPayload.fallback_reason = "Server OCR returned no usable table rows.";
     return fallbackPayload;
   } catch (error) {
+    updateStatus(ui.ocrStatus, `Server OCR was slow or failed. Switching to browser OCR...`);
     const fallbackPayload = await requestBrowserOcr(imageBase64);
     fallbackPayload.fallback_reason = error.message;
     return fallbackPayload;
   }
+}
+
+async function extractImageContextFromFile(file) {
+  const resolvedFile = file || await pickImageFile();
+  updateStatus(ui.ocrStatus, "Preparing image for OCR...");
+  const originalImageBase64 = await fileToDataUrl(resolvedFile);
+  const optimizedImage = await optimizeImageForOcr(originalImageBase64);
+  const imageBase64 = optimizedImage.imageBase64;
+
+  if (optimizedImage.scaled) {
+    updateStatus(
+      ui.ocrStatus,
+      `Optimized image for OCR (${optimizedImage.originalWidth}x${optimizedImage.originalHeight} -> ${optimizedImage.width}x${optimizedImage.height}).`
+    );
+  }
+
+  updateStatus(ui.ocrStatus, "Analyzing image layout...");
+  const payload = await requestStructuredOcr(imageBase64);
+  const rows = rowsFromOcrPayload(payload);
+
+  setLatestImageContext(resolvedFile.name, { rows, payload });
+
+  return {
+    fileName: resolvedFile.name,
+    imageBase64,
+    originalImageBase64,
+    payload,
+    rows,
+  };
 }
 
 async function pasteOcrImageToServerWorkbook(imageBase64) {
@@ -1448,34 +1681,26 @@ async function pasteOcrImageToServerWorkbook(imageBase64) {
     throw new Error("Workbook file and sheet name are required for server OCR paste");
   }
 
-  const response = await fetch("/api/paste-ocr", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      filepath: config.filepath,
-      sheet_name: config.sheet_name,
-      start_cell: config.start_cell,
-      image_base64: imageBase64,
-      use_ai_layout: true,
-    }),
-  });
-
-  if (!response.ok) {
-    const payload = await response.text();
-    throw new Error(payload || `OCR paste failed (${response.status})`);
-  }
-
-  return response.json();
+  return fetchJsonWithTimeout(
+    "/api/paste-ocr",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filepath: config.filepath,
+        sheet_name: config.sheet_name,
+        start_cell: config.start_cell,
+        image_base64: imageBase64,
+        use_ai_layout: false,
+      }),
+    },
+    OCR_SERVER_TIMEOUT_MS,
+  );
 }
 
-async function runOcrFlow() {
-  const file = await pickImageFile();
-  updateStatus(ui.ocrStatus, "Preparing image for OCR...");
-  const imageBase64 = await fileToDataUrl(file);
-
-  updateStatus(ui.ocrStatus, "Analyzing image layout...");
-  const payload = await requestStructuredOcr(imageBase64);
-  const rows = rowsFromOcrPayload(payload);
+async function runOcrFlow(file = null) {
+  const imageResult = await extractImageContextFromFile(file);
+  const { fileName, imageBase64, payload, rows } = imageResult;
 
   if (!rows.length) {
     throw new Error("OCR finished, but no table-like data could be detected from the image.");
@@ -1495,6 +1720,7 @@ async function runOcrFlow() {
   updateStatus(ui.ocrStatus, `OCR complete (${engine}, ${source}). ${rows.length} rows x ${cols} cols from ${lines} lines.${fallbackNote}`);
 
   return {
+    fileName,
     rows,
     imageBase64,
     payload,
@@ -1514,6 +1740,38 @@ function bindEvents() {
     void sendChat();
   });
 
+  ui.chatImageBtn.addEventListener("click", async () => {
+    await runBusyTask("Reading image content for AI...", async () => {
+      try {
+        const file = await pickImageFile();
+        const imageResult = await extractImageContextFromFile(file);
+        const hasRows = Array.isArray(imageResult.rows) && imageResult.rows.length > 0;
+        const extractedText = String((imageResult.payload && imageResult.payload.text) || "").trim();
+
+        if (!hasRows && !extractedText) {
+          throw new Error("The image was read, but no usable text or table data was detected.");
+        }
+
+        if (hasRows) {
+          state.parsedRows = imageResult.rows;
+          ui.pasteInput.value = rowsToTsv(imageResult.rows);
+          renderPreview(imageResult.rows);
+        }
+
+        appendMessage(
+          "system",
+          hasRows
+            ? `Image attached for AI context: ${imageResult.fileName} (${imageResult.rows.length} row(s) detected).`
+            : `Image attached for AI context: ${imageResult.fileName} (text extracted).`
+        );
+        updateStatus(ui.actionStatus, `Image context ready from ${imageResult.fileName}. Send your prompt.`);
+      } catch (error) {
+        updateStatus(ui.ocrStatus, error.message, true);
+        updateStatus(ui.actionStatus, error.message, true);
+      }
+    });
+  });
+
   ui.chatInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -1526,6 +1784,9 @@ function bindEvents() {
       return;
     }
     state.messages = [];
+    state.parsedRows = [];
+    state.lastSheetSnapshot = null;
+    state.latestImageContext = null;
     ui.messages.innerHTML = "";
     appendMessage("system", "Conversation cleared.");
   });
