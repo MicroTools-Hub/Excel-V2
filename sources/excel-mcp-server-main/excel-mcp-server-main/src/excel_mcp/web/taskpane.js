@@ -739,10 +739,12 @@ async function resolveWorksheet(context, sheetName) {
   return candidate;
 }
 
-async function collectExcelSheetSnapshot() {
+async function collectExcelSheetSnapshot(options = {}) {
   if (!state.isExcelHost || !window.Excel || !window.Office) {
     return null;
   }
+
+  const includeFormulas = Boolean(options.includeFormulas);
 
   return Excel.run(async (context) => {
     const workbook = context.workbook;
@@ -765,7 +767,7 @@ async function collectExcelSheetSnapshot() {
       .getCell(0, 0)
       .getResizedRange(selectionPreviewRows - 1, selectionPreviewCols - 1);
 
-    selectionPreviewRange.load("address,rowCount,columnCount,values,formulas");
+    selectionPreviewRange.load(includeFormulas ? "address,rowCount,columnCount,values,formulas" : "address,rowCount,columnCount,values");
 
     let usedPreviewRange = null;
     if (!usedRange.isNullObject) {
@@ -774,7 +776,7 @@ async function collectExcelSheetSnapshot() {
       usedPreviewRange = usedRange
         .getCell(0, 0)
         .getResizedRange(previewRows - 1, previewCols - 1);
-      usedPreviewRange.load("address,rowCount,columnCount,values,formulas");
+      usedPreviewRange.load("address,rowCount,columnCount,values");
     }
 
     await context.sync();
@@ -793,7 +795,7 @@ async function collectExcelSheetSnapshot() {
         selection_preview_row_count: selectionPreviewRange.rowCount,
         selection_preview_column_count: selectionPreviewRange.columnCount,
         selection_values: selectionPreviewRange.values,
-        selection_formulas: selectionPreviewRange.formulas,
+        selection_formulas: includeFormulas ? selectionPreviewRange.formulas : [],
         used_range_address: null,
         preview_address: null,
         snapshot_mode: "empty",
@@ -813,7 +815,7 @@ async function collectExcelSheetSnapshot() {
       selection_preview_row_count: selectionPreviewRange.rowCount,
       selection_preview_column_count: selectionPreviewRange.columnCount,
       selection_values: selectionPreviewRange.values,
-      selection_formulas: selectionPreviewRange.formulas,
+      selection_formulas: includeFormulas ? selectionPreviewRange.formulas : [],
       used_range_address: usedRange.address,
       preview_address: usedPreviewRange ? usedPreviewRange.address : usedRange.address,
       snapshot_mode: (
@@ -825,7 +827,7 @@ async function collectExcelSheetSnapshot() {
       row_count: usedRange.rowCount,
       column_count: usedRange.columnCount,
       values: usedPreviewRange ? usedPreviewRange.values : [],
-      formulas: usedPreviewRange ? usedPreviewRange.formulas : [],
+      formulas: [],
     };
   });
 }
@@ -1132,12 +1134,19 @@ async function sendChat() {
     try {
       const config = getWorkbookConfig();
       let sheetSnapshot = null;
+      const includeFormulaPreview = /formula|calculate|calculation|sum|average|avg|percent|percentage|grade|total|pivot/i.test(prompt);
 
       if (state.isExcelHost) {
         updateStatus(ui.actionStatus, "Reading active sheet context...");
         try {
-          sheetSnapshot = await collectExcelSheetSnapshot();
+          sheetSnapshot = await collectExcelSheetSnapshot({ includeFormulas: includeFormulaPreview });
           state.lastSheetSnapshot = sheetSnapshot;
+          if (sheetSnapshot) {
+            updateStatus(
+              ui.actionStatus,
+              `Read ${sheetSnapshot.sheet_name || "active sheet"}: ${sheetSnapshot.row_count || 0} rows x ${sheetSnapshot.column_count || 0} columns.`
+            );
+          }
         } catch (error) {
           throw new Error(`Could not read the active sheet before sending the command: ${error.message}`);
         }
@@ -1163,7 +1172,7 @@ async function sendChat() {
 
       const payload = {
         messages: state.messages,
-        filepath: config.filepath || null,
+        filepath: state.isExcelHost ? null : (config.filepath || null),
         sheet_name: effectiveSheetName,
         start_cell: effectiveStartCell,
         sheet_snapshot: sheetSnapshot,
